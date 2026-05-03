@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import math
+import time
+import urllib.parse
+import urllib.request
+from urllib.error import HTTPError
+from datetime import datetime, timedelta, timezone
+from typing import Protocol
+
+from .models import Candle, OrderbookSnapshot
+
+
+class MarketDataSource(Protocol):
+    def get_recent_candles(self, market: str, count: int) -> list[Candle]:
+        ...
+
+
+class UpbitPublicDataSource:
+    """Public Upbit candle reader. It never authenticates or places orders."""
+
+    def __init__(self, unit_minutes: int = 1, timeout_seconds: int = 10) -> None:
+        self.unit_minutes = unit_minutes
+        self.timeout_seconds = timeout_seconds
+
+    def get_recent_candles(self, market: str, count: int, unit_minutes: int | None = None) -> list[Candle]:
+        unit = unit_minutes or self.unit_minutes
+        params = urllib.parse.urlencode({"market": market, "count": count})
+        url = f"https://api.upbit.com/v1/candles/minutes/{unit}?{params}"
+        payload = self._read_json(url)
+
+        candles = []
+        for row in payload:
+            timestamp = datetime.fromisoformat(row["candle_date_time_utc"]).replace(tzinfo=timezone.utc)
+            candles.append(
+                Candle(
+                    market=market,
+                    timestamp=timestamp,
+                    open=float(row["opening_price"]),
+                    high=float(row["high_price"]),
+                    low=float(row["low_price"]),
+                    close=float(row["trade_price"]),
+                    volume=float(row["candle_acc_trade_volume"]),
+                )
+            )
+        return list(reversed(candles))
+
+    def get_orderbook_snapshot(self, market: str) -> OrderbookSnapshot:
+        params = urllib.parse.urlencode({"markets": market})
+        url = f"https://api.upbit.com/v1/orderbook?{params}"
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        row = payload[0]
+        units = row.get("orderbook_units", [])
+        first = units[0] if units else {}
+        total_bid_size = sum(float(unit.get("bid_size", 0.0)) for unit in units)
+        total_ask_size = sum(float(unit.get("ask_size", 0.0)) for unit in units)
+        return OrderbookSnapshot(
+            market=market,
+            timestamp=datetime.now(timezone.utc),
+            best_bid_price=float(first.get("bid_price", 0.0)),
+            best_bid_size=float(first.get("bid_size", 0.0)),
+            best_ask_price=float(first.get("ask_price", 0.0)),
+            best_ask_size=float(first.get("ask_size", 0.0)),
+            total_bid_size=total_bid_size,
+            total_ask_size=total_ask_size,
+        )
+
+    def get_top_krw_markets(self, count: int, min_trade_price_krw: float = 0.0) -> list[str]:
+        markets = self._get_krw_markets()
+        tickers = []
+        for chunk in chunks(markets, 80):
+            params = urllib.parse.urlencode({"markets": ",".join(chunk)})
+            url = f"https://api.upbit.com/v1/ticker?{params}"
+            tickers.extend(self._read_json(url))
+        if min_trade_price_krw > 0:
+            tickers = [row for row in tickers if float(row.get("trade_price", 0.0)) >= min_trade_price_krw]
+        tickers.sort(key=lambda row: float(row.get("acc_trade_price_24h", 0.0)), reverse=True)
+        return [str(row["market"]) for row in tickers[:count]]
+
+    def _get_krw_markets(self) -> list[str]:
+        url = "https://api.upbit.com/v1/market/all?isDetails=false"
+        payload = self._read_json(url)
+        return sorted(str(row["market"]) for row in payload if str(row["market"]).startswith("KRW-"))
+
+    def _read_json(self, url: str, retries: int = 3) -> list[dict]:
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                if exc.code != 429 or attempt >= retries:
+                    raise
+                retry_after = exc.headers.get("Remaining-Req") or ""
+                wait_seconds = 1.0 + attempt * 1.5
+                if "sec=0" in retry_after:
+                    wait_seconds = max(wait_seconds, 2.0)
+                time.sleep(wait_seconds)
+        raise RuntimeError("unreachable")
+
+
+class SampleMarketDataSource:
+    """Deterministic local data source for smoke tests and offline learning."""
+
+    def __init__(self) -> None:
+        self.tick = 0
+
+    def get_recent_candles(self, market: str, count: int) -> list[Candle]:
+        self.tick += 1
+        base_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        latest_index = self.tick + count
+        candles = []
+        for offset in range(count):
+            idx = latest_index - count + offset
+            trend = idx * 30_000
+            cycle = math.sin(idx / 4.0) * 450_000
+            price = 60_000_000 + trend + cycle
+            open_price = price - 80_000
+            high = price + 140_000
+            low = price - 160_000
+            volume = 1.0 + abs(math.sin(idx / 5.0)) * 2.0
+            candles.append(
+                Candle(
+                    market=market,
+                    timestamp=base_time - timedelta(minutes=count - offset),
+                    open=open_price,
+                    high=high,
+                    low=low,
+                    close=price,
+                    volume=volume,
+                )
+            )
+        return candles
+
+
+def sleep_between_ticks(seconds: int, source_name: str) -> None:
+    if source_name == "sample":
+        return
+    time.sleep(seconds)
+
+
+def chunks(values: list[str], size: int) -> list[list[str]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
