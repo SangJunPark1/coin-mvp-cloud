@@ -4,6 +4,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from coin_mvp.cloud_tick import run_cloud_ticks
 
@@ -12,9 +13,11 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         secret = os.environ.get("CRON_SECRET", "")
         if secret:
+            query = parse_qs(urlparse(self.path).query)
             provided = self.headers.get("x-cron-secret") or ""
             bearer = self.headers.get("authorization") or ""
-            if provided != secret and bearer != f"Bearer {secret}":
+            query_secret = query.get("secret", [""])[0]
+            if provided != secret and bearer != f"Bearer {secret}" and query_secret != secret:
                 self._send_json({"ok": False, "error": "unauthorized"}, status=401)
                 return
 
