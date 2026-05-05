@@ -45,6 +45,14 @@ def load_state(path) -> dict[str, Any]:
 def append_state_snapshot(events: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
     if not state:
         return events
+    latest = events[-1] if events else {}
+    latest_payload = latest.get("payload", {}) if isinstance(latest, dict) else {}
+    if (
+        latest.get("event") == "state_snapshot"
+        and isinstance(latest_payload, dict)
+        and latest_payload.get("tick") == state.get("tick")
+    ):
+        return events
     broker = state.get("broker", {}) if isinstance(state.get("broker"), dict) else {}
     risk = state.get("risk", {}) if isinstance(state.get("risk"), dict) else {}
     positions = broker.get("positions", {}) if isinstance(broker.get("positions"), dict) else {}
