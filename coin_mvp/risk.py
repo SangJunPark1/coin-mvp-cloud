@@ -46,9 +46,12 @@ class RiskManager:
         self.state.halt_started_tick = None
         self.state.halt_until_tick = None
 
-    def approve(self, signal: Signal, current_equity: float, position_fraction: float, tick: int | None = None) -> tuple[bool, str]:
+    def refresh_halt(self, current_equity: float, tick: int | None = None) -> None:
         self._release_expired_cooldown(tick)
         self._update_halt_from_equity(current_equity, tick)
+
+    def approve(self, signal: Signal, current_equity: float, position_fraction: float, tick: int | None = None) -> tuple[bool, str]:
+        self.refresh_halt(current_equity, tick)
         if signal.side == Side.SELL:
             if self.state.halted:
                 return True, f"approved risk-reducing exit: {self.state.halt_reason}"

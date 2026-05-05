@@ -52,6 +52,7 @@ class MultiMarketTradingApp:
         self.market_stopout_ticks: dict[str, list[int]] = {}
 
     def run_tick(self, tick: int) -> None:
+        self.risk.refresh_halt(self.broker.equity(self.last_prices), tick=tick)
         for market in list(self.broker.open_markets()):
             self._manage_open_position(tick, market)
         if len(self.broker.open_markets()) >= self.config.risk.max_open_positions:
