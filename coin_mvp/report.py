@@ -91,6 +91,8 @@ def render_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
 
 
 def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
+    trades = sorted(trades, key=lambda trade: parse_sort_time(trade.timestamp))
+    events = sorted(events, key=lambda event: parse_sort_time(str(event.get("timestamp", ""))))
     metrics = calculate_metrics(trades)
     pairs = pair_round_trips(trades)
     last_event = events[-1] if events else {}
@@ -631,9 +633,10 @@ def portfolio_summary(trades: list[TradeRow], events: list[dict[str, Any]]) -> d
     latest_equity = find_latest_equity(events)
     latest_prices = find_latest_prices(events)
     cash = find_latest_cash(trades, events)
-    open_positions = find_latest_positions(events)
+    positions_snapshot = find_latest_positions_snapshot(events)
+    open_positions = positions_snapshot if positions_snapshot is not None else {}
 
-    if not open_positions:
+    if positions_snapshot is None:
         for trade in trades:
             if trade.side == "buy":
                 open_positions[trade.market] = {
@@ -751,6 +754,10 @@ def find_latest_prices(events: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def find_latest_positions(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return find_latest_positions_snapshot(events) or {}
+
+
+def find_latest_positions_snapshot(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
     for event in reversed(events):
         payload = event.get("payload", {}) if isinstance(event, dict) else {}
         if not isinstance(payload, dict):
@@ -762,7 +769,7 @@ def find_latest_positions(events: list[dict[str, Any]]) -> dict[str, dict[str, A
                 for market, position in positions.items()
                 if isinstance(position, dict) and (to_float(position.get("qty")) or 0.0) > 0
             }
-    return {}
+    return None
 
 
 def find_latest_cash(trades: list[TradeRow], events: list[dict[str, Any]]) -> float | None:
@@ -1373,6 +1380,20 @@ def display_time(value: str) -> str:
         return short_time(value)
     kst = parsed.astimezone(timezone(timedelta(hours=9)))
     return kst.strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def parse_sort_time(value: str) -> datetime:
+    parsed = parse_utc_time(value)
+    if parsed is not None:
+        return parsed.astimezone(timezone.utc)
+    text = value.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S KST"):
+        try:
+            parsed = datetime.strptime(text.replace(" KST", ""), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def parse_utc_time(value: str) -> datetime | None:
