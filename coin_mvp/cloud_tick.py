@@ -180,6 +180,7 @@ def save_state(path: Path, app: MultiMarketTradingApp, tick: int, markets: list[
             "realized_pnl": app.broker.realized_pnl,
             "positions": {market: asdict(position) for market, position in app.broker.positions.items()},
         },
+        "equity": app.broker.equity(app.last_prices),
         "risk": asdict(app.risk.state),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

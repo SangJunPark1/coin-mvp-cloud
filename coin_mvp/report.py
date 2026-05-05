@@ -740,6 +740,12 @@ def find_latest_prices(events: list[dict[str, Any]]) -> dict[str, float]:
         payload = event.get("payload", {}) if isinstance(event, dict) else {}
         if not isinstance(payload, dict):
             continue
+        last_prices = payload.get("last_prices")
+        if isinstance(last_prices, dict):
+            for market, value in last_prices.items():
+                price = to_float(value)
+                if price is not None and str(market) not in prices:
+                    prices[str(market)] = price
         market = payload.get("market")
         price = to_float(payload.get("price"))
         if market and price is not None and str(market) not in prices:
