@@ -99,6 +99,8 @@ class RiskManager:
             return
         if tick < self.state.halt_until_tick:
             return
+        if self.state.halt_reason == "max consecutive losses reached":
+            self.state.consecutive_losses = 0
         self.state.halted = False
         self.state.halt_reason = ""
         self.state.halt_started_tick = None
