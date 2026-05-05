@@ -55,8 +55,8 @@ class UpstashRestStorage(CloudStorage):
 
     def persist(self, config: AppConfig) -> None:
         self._set("state", read_text(config.paths.state_file, "{}"))
-        self._set("trades", read_text(config.paths.trade_journal, TRADE_HEADER))
-        self._set("events", read_text(config.paths.event_log, ""))
+        self._set("trades", compact_trade_text(read_text(config.paths.trade_journal, TRADE_HEADER)))
+        self._set("events", compact_event_text(read_text(config.paths.event_log, "")))
 
     def reset(self, config: AppConfig) -> None:
         reset_local_files(config)
@@ -143,3 +143,21 @@ def read_text(path: Path, default: str) -> str:
     if not path.exists():
         return default
     return path.read_text(encoding="utf-8")
+
+
+def compact_trade_text(value: str) -> str:
+    max_rows = int(os.environ.get("COIN_MVP_MAX_TRADE_ROWS", "800"))
+    lines = [line for line in value.splitlines() if line.strip()]
+    if not lines:
+        return TRADE_HEADER
+    header = lines[0] if lines[0].startswith("timestamp,") else TRADE_HEADER.strip()
+    rows = lines[1:] if lines[0].startswith("timestamp,") else lines
+    kept = rows[-max_rows:] if max_rows > 0 else rows
+    return "\n".join([header, *kept]) + "\n"
+
+
+def compact_event_text(value: str) -> str:
+    max_rows = int(os.environ.get("COIN_MVP_MAX_EVENT_ROWS", "1200"))
+    lines = [line for line in value.splitlines() if line.strip()]
+    kept = lines[-max_rows:] if max_rows > 0 else lines
+    return "\n".join(kept) + ("\n" if kept else "")
