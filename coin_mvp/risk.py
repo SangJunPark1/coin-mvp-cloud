@@ -47,6 +47,7 @@ class RiskManager:
         self.state.halt_until_tick = None
 
     def refresh_halt(self, current_equity: float, tick: int | None = None) -> None:
+        self._shorten_consecutive_loss_cooldown()
         self._release_expired_cooldown(tick)
         self._update_halt_from_equity(current_equity, tick)
 
@@ -105,6 +106,18 @@ class RiskManager:
         self.state.halt_reason = ""
         self.state.halt_started_tick = None
         self.state.halt_until_tick = None
+
+    def _shorten_consecutive_loss_cooldown(self) -> None:
+        if self.state.halt_reason != "max consecutive losses reached":
+            return
+        if self.state.halt_started_tick is None:
+            return
+        cooldown_ticks = self.config.consecutive_loss_cooldown_ticks
+        desired_until = self.state.halt_started_tick + cooldown_ticks
+        if cooldown_ticks <= 0:
+            desired_until = self.state.halt_started_tick
+        if self.state.halt_until_tick is None or self.state.halt_until_tick > desired_until:
+            self.state.halt_until_tick = desired_until
 
 
 def korea_day_key(timestamp: datetime) -> str:

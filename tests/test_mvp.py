@@ -137,6 +137,51 @@ class RiskManagerTest(unittest.TestCase):
         approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=12)
         self.assertTrue(approved)
 
+    def test_consecutive_loss_cooldown_resets_loss_counter(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=5.0,
+                max_entries_per_day=12,
+                max_position_fraction=0.35,
+                max_consecutive_losses=4,
+                consecutive_loss_cooldown_ticks=2,
+            ),
+            starting_equity=1_000_000,
+        )
+        risk.state.consecutive_losses = 4
+
+        approved, reason = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=10)
+        self.assertFalse(approved)
+        self.assertEqual("max consecutive losses reached", reason)
+
+        approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=12)
+        self.assertTrue(approved)
+        self.assertEqual(0, risk.state.consecutive_losses)
+
+    def test_consecutive_loss_cooldown_can_be_shortened_after_state_was_saved(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=5.0,
+                max_entries_per_day=12,
+                max_position_fraction=0.35,
+                max_consecutive_losses=4,
+                consecutive_loss_cooldown_ticks=2,
+            ),
+            starting_equity=1_000_000,
+        )
+        risk.state.halted = True
+        risk.state.halt_reason = "max consecutive losses reached"
+        risk.state.halt_started_tick = 209
+        risk.state.halt_until_tick = 221
+        risk.state.consecutive_losses = 5
+
+        approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=216)
+        self.assertTrue(approved)
+        self.assertIsNone(risk.state.halt_until_tick)
+        self.assertEqual(0, risk.state.consecutive_losses)
+
 
 class ReportMetricsTest(unittest.TestCase):
     def test_max_drawdown_uses_cumulative_realized_pnl(self):

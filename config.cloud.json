@@ -73,7 +73,7 @@
     "max_total_position_fraction": 0.92,
     "max_consecutive_losses": 4,
     "halt_cooldown_ticks": 6,
-    "consecutive_loss_cooldown_ticks": 12,
+    "consecutive_loss_cooldown_ticks": 2,
     "max_expected_downside_to_upside_ratio": 1.0
   },
   "ai_decision": {
