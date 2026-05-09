@@ -324,6 +324,51 @@ def estimate_expected_downside_pct(candles: list[Candle], stop_loss_pct: float, 
     return max(stop_loss_pct, downside)
 
 
+def bearish_crash_candle_risk(candles: list[Candle], config: StrategyConfig) -> tuple[bool, str]:
+    if not config.enable_crash_candle_filter:
+        return False, "crash candle filter disabled"
+    if len(candles) < max(config.crash_candle_break_lookback, config.crash_candle_lookback + 2):
+        return False, "crash candle filter unavailable"
+
+    recent = candles[-config.crash_candle_lookback :]
+    for offset, candle in enumerate(reversed(recent), start=1):
+        if candle.open <= 0 or candle.close >= candle.open:
+            continue
+        body_pct = ((candle.open - candle.close) / candle.open) * 100.0
+        if body_pct < config.crash_candle_body_pct:
+            continue
+        index = len(candles) - offset
+        prior_start = max(0, index - config.crash_candle_break_lookback)
+        prior = candles[prior_start:index]
+        volume_ratio = _volume_ratio_at(candles, index, lookback=10)
+        lower_break = bool(prior) and candle.close < min(item.low for item in prior)
+        upper_wick_pct = ((candle.high - candle.open) / candle.open) * 100.0 if candle.open > 0 else 0.0
+        close_near_low = candle.close <= candle.low + ((candle.high - candle.low) * 0.35)
+        if volume_ratio >= config.crash_candle_volume_ratio or lower_break or (upper_wick_pct >= body_pct * 0.5 and close_near_low):
+            parts = [f"bearish candle {body_pct:.2f}%"]
+            if volume_ratio >= config.crash_candle_volume_ratio:
+                parts.append(f"volume {volume_ratio:.2f}x")
+            if lower_break:
+                parts.append("recent low break")
+            if upper_wick_pct >= body_pct * 0.5 and close_near_low:
+                parts.append("failed upper wick")
+            return True, "crash candle risk: " + ", ".join(parts)
+    return False, "no crash candle risk"
+
+
+def _volume_ratio_at(candles: list[Candle], index: int, lookback: int) -> float:
+    if index <= 0:
+        return 1.0
+    history_start = max(0, index - lookback)
+    history = candles[history_start:index]
+    if not history:
+        return 1.0
+    average_volume = mean([candle.volume for candle in history])
+    if average_volume <= 0:
+        return 1.0
+    return candles[index].volume / average_volume
+
+
 def market_breadth_ratio(candles_by_market: dict[str, list[Candle]], short_window: int, long_window: int, ema_window: int) -> float:
     if not candles_by_market:
         return 0.0

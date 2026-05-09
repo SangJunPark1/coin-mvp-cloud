@@ -65,6 +65,11 @@ class StrategyConfig:
     bollinger_filter_penalty: float = 0.08
     bollinger_min_confirmations: int = 2
     bollinger_min_expected_upside_pct: float = 0.3
+    enable_crash_candle_filter: bool = True
+    crash_candle_lookback: int = 3
+    crash_candle_body_pct: float = 1.2
+    crash_candle_volume_ratio: float = 1.4
+    crash_candle_break_lookback: int = 12
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,7 @@ class RiskConfig:
     max_expected_downside_to_upside_ratio: float = 1.0
     max_open_positions: int = 4
     max_total_position_fraction: float = 0.95
+    max_new_entries_per_tick: int = 1
 
 
 @dataclass(frozen=True)
@@ -188,6 +194,11 @@ def load_config(path: str | Path) -> AppConfig:
             bollinger_filter_penalty=float(strategy.get("bollinger_filter_penalty", 0.08)),
             bollinger_min_confirmations=int(strategy.get("bollinger_min_confirmations", 2)),
             bollinger_min_expected_upside_pct=float(strategy.get("bollinger_min_expected_upside_pct", 0.3)),
+            enable_crash_candle_filter=bool(strategy.get("enable_crash_candle_filter", True)),
+            crash_candle_lookback=int(strategy.get("crash_candle_lookback", 3)),
+            crash_candle_body_pct=float(strategy.get("crash_candle_body_pct", 1.2)),
+            crash_candle_volume_ratio=float(strategy.get("crash_candle_volume_ratio", 1.4)),
+            crash_candle_break_lookback=int(strategy.get("crash_candle_break_lookback", 12)),
         ),
         risk=RiskConfig(
             daily_profit_target_pct=float(risk["daily_profit_target_pct"]),
@@ -200,6 +211,7 @@ def load_config(path: str | Path) -> AppConfig:
             max_expected_downside_to_upside_ratio=float(risk.get("max_expected_downside_to_upside_ratio", 1.0)),
             max_open_positions=int(risk.get("max_open_positions", 4)),
             max_total_position_fraction=float(risk.get("max_total_position_fraction", 0.95)),
+            max_new_entries_per_tick=int(risk.get("max_new_entries_per_tick", 1)),
         ),
         ai_decision=AiDecisionConfig(
             enabled=bool(ai_decision.get("enabled", True)),
@@ -333,6 +345,14 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("bollinger_min_confirmations must be at least 1.")
     if config.strategy.bollinger_min_expected_upside_pct < 0:
         raise ValueError("bollinger_min_expected_upside_pct must not be negative.")
+    if config.strategy.crash_candle_lookback < 1:
+        raise ValueError("crash_candle_lookback must be at least 1.")
+    if config.strategy.crash_candle_body_pct < 0:
+        raise ValueError("crash_candle_body_pct must not be negative.")
+    if config.strategy.crash_candle_volume_ratio <= 0:
+        raise ValueError("crash_candle_volume_ratio must be positive.")
+    if config.strategy.crash_candle_break_lookback < 2:
+        raise ValueError("crash_candle_break_lookback must be at least 2.")
     if not 0 < config.risk.max_position_fraction <= 1:
         raise ValueError("max_position_fraction must be between 0 and 1.")
     if config.risk.max_open_positions < 1:
@@ -341,6 +361,8 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_total_position_fraction must be between 0 and 1.")
     if config.risk.max_entries_per_day < 1:
         raise ValueError("max_entries_per_day must be at least 1.")
+    if config.risk.max_new_entries_per_tick < 1:
+        raise ValueError("max_new_entries_per_tick must be at least 1.")
     if config.risk.halt_cooldown_ticks < 0:
         raise ValueError("halt_cooldown_ticks must not be negative.")
     if config.risk.consecutive_loss_cooldown_ticks < 0:

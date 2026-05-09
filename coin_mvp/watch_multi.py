@@ -16,6 +16,7 @@ from .models import Candle, Side, Signal
 from .risk import RiskManager
 from .strategy import (
     MovingAverageStrategy,
+    bearish_crash_candle_risk,
     bollinger_lower_rebound_quality,
     btc_regime_allows_entries,
     calculate_ema,
@@ -152,6 +153,12 @@ class MultiMarketTradingApp:
             if signal.side != Side.BUY:
                 signal = self._bollinger_rebound_entry_signal(candles, filter_reason, signal)
             if signal.side == Side.BUY:
+                rr_ok, rr_reason = self._reward_risk_ok(candles)
+                if not rr_ok:
+                    blocked_reasons[rr_reason] = blocked_reasons.get(rr_reason, 0) + 1
+                    if len(blocked_samples) < 20:
+                        blocked_samples.append({"market": market, "reason": rr_reason, "price": candles[-1].close})
+                    continue
                 penalty = self._recent_stopout_penalty(market, tick) + filter_penalty + trend_screen_penalty
                 candidates.append((candidate_score(candles, signal, self.config.strategy, penalty=penalty) * context.score_multiplier, market, candles, signal))
             else:
@@ -278,6 +285,8 @@ class MultiMarketTradingApp:
             self.position_entry_tick[market] = tick
             self.position_entry_strategy[market] = self._entry_strategy_name(signal)
             filled_count += 1
+            if filled_count >= self.config.risk.max_new_entries_per_tick:
+                break
         if filled_count == 0:
             self.journal.event(
                 "market_scan",
@@ -316,6 +325,9 @@ class MultiMarketTradingApp:
         self._prune_stopouts(market, tick)
         if len(self.market_stopout_ticks.get(market, [])) >= self.config.strategy.max_recent_stopouts_per_market:
             return True, f"recent stopouts limit reached: {market}", 0.0
+        crash_risk, crash_reason = bearish_crash_candle_risk(candles, self.config.strategy)
+        if crash_risk:
+            return True, crash_reason, 0.0
         orderbook = self.data_source.get_orderbook_snapshot(market)
         spread_limit = self.config.strategy.max_orderbook_spread_bps
         if orderbook.spread_bps > spread_limit * 2.0:
@@ -348,6 +360,22 @@ class MultiMarketTradingApp:
             reasons.append(bollinger_reason)
         reason = "; ".join(reasons) if reasons else mtf_reason
         return False, reason, total_penalty
+
+    def _reward_risk_ok(self, candles: list[Candle]) -> tuple[bool, str]:
+        expected_upside = estimate_expected_upside_pct(candles, self.config.strategy.target_upside_pct)
+        expected_downside = estimate_expected_downside_pct(
+            candles,
+            self.config.strategy.stop_loss_pct,
+            self.config.strategy.stop_volatility_multiplier,
+        )
+        if expected_upside <= 0:
+            return False, "reward-risk blocked: no expected upside"
+        downside_to_upside = expected_downside / expected_upside
+        if downside_to_upside > self.config.risk.max_expected_downside_to_upside_ratio:
+            reward_risk = expected_upside / expected_downside if expected_downside > 0 else 999.0
+            required = 1.0 / self.config.risk.max_expected_downside_to_upside_ratio
+            return False, f"reward-risk blocked: {reward_risk:.2f}R < {required:.2f}R"
+        return True, f"reward-risk ok: upside {expected_upside:.2f}%, downside {expected_downside:.2f}%"
 
     def _bollinger_rebound_entry_signal(self, candles: list[Candle], filter_reason: str, fallback: Signal) -> Signal:
         if not self.config.strategy.enable_bollinger_rebound_filter:
@@ -599,6 +627,9 @@ class MultiMarketTradingApp:
             "market": market,
             "price": price,
             "equity": equity,
+            "cash": self.broker.cash,
+            "positions": {market: asdict(position) for market, position in self.broker.positions.items()},
+            "last_prices": self.last_prices,
             "signal": signal,
             "approved": approved,
             "risk_reason": risk_reason,
