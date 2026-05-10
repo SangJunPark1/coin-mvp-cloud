@@ -264,7 +264,7 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     </div>
     <div class="dashboard-grid">
       <section><h2>오픈 포지션</h2>{render_open_positions(events)}</section>
-      <section><h2>실시간 판단 로그</h2>{render_ops_log(events[-80:])}</section>
+      <section><h2>실시간 판단 로그</h2>{render_ops_log_current(events[-120:], trades[-80:])}</section>
     </div>
     <div class="split-grid">
       <section><h2>최근 체결</h2>{render_trade_table(trades[-80:])}</section>
@@ -622,6 +622,56 @@ def render_ops_log(events: list[dict[str, Any]]) -> str:
         lines.append(
             f'<div class="ops-line"><span class="time">{html.escape(display_time(str(event.get("timestamp", ""))))}</span> '
             f'<span class="event">{html.escape(korean_event(name))}</span> {html.escape(text)}</div>'
+        )
+        if len(lines) >= 80:
+            break
+    return '<div class="ops-log">' + "".join(lines) + "</div>"
+
+
+def render_ops_log_current(events: list[dict[str, Any]], trades: list[TradeRow]) -> str:
+    if not events and not trades:
+        return empty_block("아직 판단 로그가 없습니다.")
+    entries: list[tuple[datetime, str, str, str]] = []
+    for trade in trades:
+        text = (
+            f"{trade.market} {korean_side(trade.side)} 체결 · "
+            f"손익 {krw(trade.realized_pnl)} · {korean_reason(trade.reason)}"
+        )
+        entries.append((parse_sort_time(trade.timestamp), trade.timestamp, "체결", text))
+    for event in events:
+        name = str(event.get("event", ""))
+        payload = event.get("payload", {}) if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        if name == "state_snapshot":
+            positions = payload.get("positions", {})
+            position_count = len(positions) if isinstance(positions, dict) else 0
+            risk = payload.get("risk", {}) if isinstance(payload.get("risk"), dict) else {}
+            state = "중지" if risk.get("halted") else "운영 중"
+            text = (
+                f"상태 동기화 · tick {payload.get('tick', '-')} · {state} · "
+                f"오픈 포지션 {position_count}개 · 평가 {krw(to_float(payload.get('equity')))}"
+            )
+        elif name == "tick":
+            signal = payload.get("signal", {})
+            side = signal.get("side", "-") if isinstance(signal, dict) else "-"
+            reason = signal.get("reason", "-") if isinstance(signal, dict) else "-"
+            text = f'{payload.get("market", "-")} {side} · {korean_reason(str(reason))}'
+        elif name in {"fill", "forced_exit"}:
+            fill = payload.get("fill", {})
+            text = f'{fill.get("market", "-")} {korean_side(str(fill.get("side", "-")))} 체결 · 손익 {krw(to_float(fill.get("realized_pnl")))}'
+        elif name == "market_scan":
+            text = f'스캔 {payload.get("markets_scanned", 0)}개 · 후보 {payload.get("candidates", 0)}개 · {korean_reason(str(payload.get("reason", "")))}'
+        elif name == "watch_error":
+            text = f'오류 · {payload.get("error", "-")}'
+        else:
+            continue
+        entries.append((parse_sort_time(str(event.get("timestamp", ""))), str(event.get("timestamp", "")), korean_event(name), text))
+    lines = []
+    for _, timestamp, label, text in sorted(entries, key=lambda item: item[0], reverse=True):
+        lines.append(
+            f'<div class="ops-line"><span class="time">{html.escape(display_time(timestamp))}</span> '
+            f'<span class="event">{html.escape(label)}</span> {html.escape(text)}</div>'
         )
         if len(lines) >= 80:
             break
@@ -1019,6 +1069,33 @@ def render_market_context_table(events: list[dict[str, Any]]) -> str:
     for event in reversed(events):
         payload = event.get("payload", {}) if isinstance(event, dict) else {}
         if not isinstance(payload, dict):
+            continue
+        if str(event.get("event", "")) == "state_snapshot":
+            positions = payload.get("positions", {})
+            position_count = len(positions) if isinstance(positions, dict) else 0
+            risk = payload.get("risk", {}) if isinstance(payload.get("risk"), dict) else {}
+            risk_state = "중지" if risk.get("halted") else "운영 중"
+            rows.append(
+                (
+                    display_time(str(event.get("timestamp", ""))),
+                    risk_state,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    (
+                        f"state tick {payload.get('tick', '-')}; "
+                        f"cash {krw(to_float(payload.get('cash')))}; "
+                        f"equity {krw(to_float(payload.get('equity')))}; "
+                        f"open positions {position_count}"
+                    ),
+                )
+            )
+            if len(rows) >= 30:
+                break
             continue
         context = payload.get("decision_context")
         if not isinstance(context, dict):

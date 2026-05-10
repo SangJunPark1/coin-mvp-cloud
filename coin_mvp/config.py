@@ -85,6 +85,7 @@ class RiskConfig:
     max_open_positions: int = 4
     max_total_position_fraction: float = 0.95
     max_new_entries_per_tick: int = 1
+    min_trade_cash_krw: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,7 @@ def load_config(path: str | Path) -> AppConfig:
             max_open_positions=int(risk.get("max_open_positions", 4)),
             max_total_position_fraction=float(risk.get("max_total_position_fraction", 0.95)),
             max_new_entries_per_tick=int(risk.get("max_new_entries_per_tick", 1)),
+            min_trade_cash_krw=float(risk.get("min_trade_cash_krw", 0.0)),
         ),
         ai_decision=AiDecisionConfig(
             enabled=bool(ai_decision.get("enabled", True)),
@@ -363,6 +365,8 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_entries_per_day must be at least 1.")
     if config.risk.max_new_entries_per_tick < 1:
         raise ValueError("max_new_entries_per_tick must be at least 1.")
+    if config.risk.min_trade_cash_krw < 0:
+        raise ValueError("min_trade_cash_krw must not be negative.")
     if config.risk.halt_cooldown_ticks < 0:
         raise ValueError("halt_cooldown_ticks must not be negative.")
     if config.risk.consecutive_loss_cooldown_ticks < 0:

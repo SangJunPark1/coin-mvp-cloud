@@ -275,6 +275,17 @@ class MultiMarketTradingApp:
                 total_budget_remaining,
                 self.broker.cash,
             )
+            if cash_to_use < self.config.risk.min_trade_cash_krw:
+                self.journal.event(
+                    "fill_skipped",
+                    {
+                        "tick": tick,
+                        "market": market,
+                        "signal": signal,
+                        "reason": f"trade cash below minimum: {cash_to_use:.0f} < {self.config.risk.min_trade_cash_krw:.0f}",
+                    },
+                )
+                continue
             fill = self.broker.buy(market, signal.price, cash_to_use, f"{signal.reason}; {context.reason}; selected from top-volume scan")
             if fill is None:
                 self.journal.event("fill_skipped", {"tick": tick, "signal": signal, "market": market})

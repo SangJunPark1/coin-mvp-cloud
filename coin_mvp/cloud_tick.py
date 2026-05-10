@@ -81,6 +81,7 @@ def run_cloud_ticks(
         completed_tick = tick
 
     save_state(config.paths.state_file, app, completed_tick, markets)
+    app.journal.event("state_snapshot", build_state_snapshot(app, completed_tick, markets))
     refresh_outputs(config, outputs)
     storage.persist(config)
     return {
@@ -184,6 +185,18 @@ def save_state(path: Path, app: MultiMarketTradingApp, tick: int, markets: list[
         "risk": asdict(app.risk.state),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_state_snapshot(app: MultiMarketTradingApp, tick: int, markets: list[str]) -> dict[str, Any]:
+    return {
+        "tick": tick,
+        "markets": markets,
+        "cash": app.broker.cash,
+        "equity": app.broker.equity(app.last_prices),
+        "positions": {market: asdict(position) for market, position in app.broker.positions.items()},
+        "last_prices": app.last_prices,
+        "risk": asdict(app.risk.state),
+    }
 
 
 def refresh_outputs(config: AppConfig, outputs: list[Path]) -> None:
