@@ -128,6 +128,9 @@ def apply_state(app: MultiMarketTradingApp, state: dict[str, Any]) -> None:
     app.position_entry_tick = int_dict(state.get("position_entry_tick", {}))
     app.position_entry_strategy = str_dict(state.get("position_entry_strategy", {}))
     app.market_reentry_until_tick = int_dict(state.get("market_reentry_until_tick", {}))
+    last_context = state.get("last_decision_context", {})
+    if isinstance(last_context, dict):
+        app.last_decision_context = last_context
     stopout_ticks = state.get("market_stopout_ticks", {})
     if isinstance(stopout_ticks, dict):
         app.market_stopout_ticks = {
@@ -176,6 +179,7 @@ def save_state(path: Path, app: MultiMarketTradingApp, tick: int, markets: list[
         "position_entry_strategy": app.position_entry_strategy,
         "market_reentry_until_tick": app.market_reentry_until_tick,
         "market_stopout_ticks": app.market_stopout_ticks,
+        "last_decision_context": app.last_decision_context,
         "broker": {
             "cash": app.broker.cash,
             "realized_pnl": app.broker.realized_pnl,
@@ -195,6 +199,7 @@ def build_state_snapshot(app: MultiMarketTradingApp, tick: int, markets: list[st
         "equity": app.broker.equity(app.last_prices),
         "positions": {market: asdict(position) for market, position in app.broker.positions.items()},
         "last_prices": app.last_prices,
+        "decision_context": app.last_decision_context,
         "risk": asdict(app.risk.state),
     }
 

@@ -51,6 +51,7 @@ class MultiMarketTradingApp:
         self.last_prices: dict[str, float] = {}
         self.market_reentry_until_tick: dict[str, int] = {}
         self.market_stopout_ticks: dict[str, list[int]] = {}
+        self.last_decision_context: dict[str, object] = {}
 
     def run_tick(self, tick: int) -> None:
         self.risk.refresh_halt(self.broker.equity(self.last_prices), tick=tick)
@@ -95,6 +96,7 @@ class MultiMarketTradingApp:
 
     def _scan_and_enter(self, tick: int) -> None:
         context = collect_decision_context(self.data_source, self.config.strategy)
+        self.last_decision_context = context.to_dict()
         if self.request_delay > 0:
             time.sleep(self.request_delay)
         if not context.allows_entries:
@@ -215,6 +217,7 @@ class MultiMarketTradingApp:
         ]
         adjusted_candidates.sort(key=lambda item: item[0], reverse=True)
         filled_count = 0
+        max_new_entries = self._max_new_entries_for_context(context)
         for score, market, candles, signal in adjusted_candidates:
             if score <= 0:
                 continue
@@ -223,7 +226,7 @@ class MultiMarketTradingApp:
             latest_price = candles[-1].close
             self.last_prices[market] = latest_price
             equity = self.broker.equity(self.last_prices)
-            position_fraction = volatility_adjusted_position_fraction(candles, self.config.strategy)
+            position_fraction = self._position_fraction_for_context(candles, context)
             decision_review = review_entry_candidate(signal, candles, context, self.config.strategy, self.config.ai_decision)
             if decision_review.action != "buy":
                 self._log_tick(
@@ -296,7 +299,7 @@ class MultiMarketTradingApp:
             self.position_entry_tick[market] = tick
             self.position_entry_strategy[market] = self._entry_strategy_name(signal)
             filled_count += 1
-            if filled_count >= self.config.risk.max_new_entries_per_tick:
+            if filled_count >= max_new_entries:
                 break
         if filled_count == 0:
             self.journal.event(
@@ -387,6 +390,18 @@ class MultiMarketTradingApp:
             required = 1.0 / self.config.risk.max_expected_downside_to_upside_ratio
             return False, f"reward-risk blocked: {reward_risk:.2f}R < {required:.2f}R"
         return True, f"reward-risk ok: upside {expected_upside:.2f}%, downside {expected_downside:.2f}%"
+
+    def _position_fraction_for_context(self, candles: list[Candle], context) -> float:
+        base = volatility_adjusted_position_fraction(candles, self.config.strategy)
+        multiplier = float(getattr(context, "position_fraction_multiplier", 1.0) or 1.0)
+        return max(0.0, base * multiplier)
+
+    def _max_new_entries_for_context(self, context) -> int:
+        configured = max(1, self.config.risk.max_new_entries_per_tick)
+        mode = str(getattr(context, "market_mode", "neutral"))
+        if mode == "risk_on":
+            return configured
+        return 1
 
     def _bollinger_rebound_entry_signal(self, candles: list[Candle], filter_reason: str, fallback: Signal) -> Signal:
         if not self.config.strategy.enable_bollinger_rebound_filter:

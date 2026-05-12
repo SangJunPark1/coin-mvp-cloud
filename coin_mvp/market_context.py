@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import StrategyConfig
 from .data import UpbitPublicDataSource
 from .models import Candle
 from .strategy import recent_volatility_pct
+
+KST = timezone(timedelta(hours=9))
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,10 @@ class DecisionContext:
     score_multiplier: float
     btc_momentum_pct: float
     btc_volatility_pct: float
+    market_mode: str = "neutral"
+    mode_reason: str = ""
+    session_label: str = ""
+    position_fraction_multiplier: float = 1.0
     fear_greed_value: int | None = None
     fear_greed_label: str = "unknown"
     onchain_tx_count: int | None = None
@@ -38,44 +45,64 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
     tx_count = fetch_blockchain_tx_count()
     global_change, btc_dominance = fetch_coingecko_global()
     binance_change, binance_quote_volume = fetch_binance_btcusdt_24h()
+    session_label, session_bias = current_session_label()
 
     allows = True
     reasons = [f"BTC momentum {btc_momentum:.2f}%", f"BTC volatility {btc_volatility:.2f}%"]
-    multiplier = 1.0
+    mode_score = session_bias
 
     if btc_momentum < config.min_btc_momentum_pct:
-        allows = False
-        multiplier *= 0.7
+        mode_score -= 1.0
         reasons.append("BTC trend weak")
+    elif btc_momentum >= 0.25:
+        mode_score += 1.5
+    elif btc_momentum >= 0.0:
+        mode_score += 0.6
     if fear_value is not None:
         reasons.append(f"fear-greed {fear_value} {fear_label}")
         if fear_value >= 85:
-            multiplier *= 0.85
+            mode_score -= 0.8
             reasons.append("market greed overheated")
         elif fear_value <= 15:
-            multiplier *= 0.8
+            mode_score -= 1.0
             reasons.append("market fear stressed")
     if tx_count is not None:
         reasons.append(f"BTC tx {tx_count}")
     if global_change is not None:
         reasons.append(f"global cap 24h {global_change:.2f}%")
         if global_change < -3.0:
-            multiplier *= 0.85
+            mode_score -= 1.3
             reasons.append("global crypto market weak")
+        elif global_change < -1.0:
+            mode_score -= 0.5
+        elif global_change > 1.0:
+            mode_score += 0.8
     if btc_dominance is not None:
         reasons.append(f"BTC dominance {btc_dominance:.2f}%")
     if binance_change is not None:
         reasons.append(f"Binance BTCUSDT 24h {binance_change:.2f}%")
         if binance_change < -2.0:
-            multiplier *= 0.9
+            mode_score -= 0.8
             reasons.append("global BTC pair weak")
+        elif binance_change > 1.0:
+            mode_score += 0.5
+
+    market_mode, mode_multiplier, position_multiplier = classify_market_mode(mode_score, btc_momentum, global_change, binance_change)
+    if market_mode == "capital_protect":
+        allows = False
+    reasons.append(f"session {session_label}")
+    reasons.append(f"mode {market_mode} score {mode_score:.2f}")
 
     return DecisionContext(
         allows_entries=allows,
         reason="; ".join(reasons),
-        score_multiplier=multiplier,
+        score_multiplier=mode_multiplier,
         btc_momentum_pct=btc_momentum,
         btc_volatility_pct=btc_volatility,
+        market_mode=market_mode,
+        mode_reason=f"score {mode_score:.2f}; session {session_label}",
+        session_label=session_label,
+        position_fraction_multiplier=position_multiplier,
         fear_greed_value=fear_value,
         fear_greed_label=fear_label,
         onchain_tx_count=tx_count,
@@ -84,6 +111,39 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
         binance_btcusdt_change_pct=binance_change,
         binance_btcusdt_quote_volume=binance_quote_volume,
     )
+
+
+def current_session_label(now: datetime | None = None) -> tuple[str, float]:
+    now = now or datetime.now(KST)
+    hour = now.astimezone(KST).hour
+    if 8 <= hour < 11:
+        return "asia_morning_check", 0.2
+    if 11 <= hour < 15:
+        return "korea_midday", -0.1
+    if 15 <= hour < 19:
+        return "europe_prepare", 0.2
+    if 19 <= hour < 22:
+        return "evening_liquidity", 0.3
+    if 22 <= hour or hour < 2:
+        return "us_overlap", 0.4
+    return "late_quiet", -0.2
+
+
+def classify_market_mode(
+    score: float,
+    btc_momentum_pct: float,
+    global_change_pct: float | None,
+    binance_change_pct: float | None,
+) -> tuple[str, float, float]:
+    severe_global = global_change_pct is not None and global_change_pct <= -3.0
+    severe_btc = binance_change_pct is not None and binance_change_pct <= -2.5
+    if score <= -2.2 and (btc_momentum_pct < -0.35 or severe_global or severe_btc):
+        return "capital_protect", 0.0, 0.0
+    if score >= 2.0:
+        return "risk_on", 1.18, 1.15
+    if score >= -0.4:
+        return "neutral", 1.0, 1.0
+    return "risk_off", 0.82, 0.7
 
 
 def candle_momentum_pct(candles: list[Candle], lookback: int) -> float:

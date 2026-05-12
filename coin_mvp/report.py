@@ -101,6 +101,10 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     portfolio = portfolio_summary(trades, events)
     refreshed_at = display_time(str(last_event.get("timestamp", ""))) if last_event else "아직 없음"
     open_positions = find_latest_positions(events)
+    latest_context = find_latest_decision_context(events)
+    market_mode = str(latest_context.get("market_mode", "unknown")) if latest_context else "unknown"
+    session_label = str(latest_context.get("session_label", "-")) if latest_context else "-"
+    mode_class = "ok" if market_mode == "risk_on" else "warn" if market_mode in {"risk_off", "capital_protect"} else ""
     cash = portfolio.get("cash", portfolio["current_equity"])
     change = float(portfolio["change_amount"])
     return_class = "pos" if change >= 0 else "neg"
@@ -254,6 +258,8 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
         <div class="state-grid">
           {render_state_item("상태", operation_state, operation_class)}
           {render_state_item("오픈 포지션", f"{len(open_positions)}개", "")}
+          {render_state_item("시장 모드", market_mode, mode_class)}
+          {render_state_item("시장 세션", session_label, "")}
           {render_state_item("오늘 진입", str(risk.get("entries_today", 0)), "")}
           {render_state_item("연속 손실", str(risk.get("consecutive_losses", 0)), "warn" if int(risk.get("consecutive_losses", 0) or 0) else "")}
           {render_state_item("3% 목표 진행률", pct(target_progress), return_class)}
@@ -813,6 +819,17 @@ def find_latest_positions(events: list[dict[str, Any]]) -> dict[str, dict[str, A
     return find_latest_positions_snapshot(events) or {}
 
 
+def find_latest_decision_context(events: list[dict[str, Any]]) -> dict[str, Any]:
+    for event in reversed(events):
+        payload = event.get("payload", {}) if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        context = payload.get("decision_context")
+        if isinstance(context, dict):
+            return context
+    return {}
+
+
 def find_latest_positions_snapshot(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
     for event in reversed(events):
         payload = event.get("payload", {}) if isinstance(event, dict) else {}
@@ -1074,11 +1091,14 @@ def render_market_context_table(events: list[dict[str, Any]]) -> str:
             positions = payload.get("positions", {})
             position_count = len(positions) if isinstance(positions, dict) else 0
             risk = payload.get("risk", {}) if isinstance(payload.get("risk"), dict) else {}
+            context = payload.get("decision_context", {}) if isinstance(payload.get("decision_context"), dict) else {}
             risk_state = "중지" if risk.get("halted") else "운영 중"
             rows.append(
                 (
                     display_time(str(event.get("timestamp", ""))),
                     risk_state,
+                    str(context.get("market_mode", "-")),
+                    str(context.get("session_label", "-")),
                     "-",
                     "-",
                     "-",
@@ -1104,6 +1124,8 @@ def render_market_context_table(events: list[dict[str, Any]]) -> str:
             (
                 display_time(str(event.get("timestamp", ""))),
                 "허용" if context.get("allows_entries") else "차단",
+                str(context.get("market_mode", "-")),
+                str(context.get("session_label", "-")),
                 pct((to_float(context.get("score_multiplier")) or 0.0) - 1.0),
                 pct((to_float(context.get("btc_momentum_pct")) or 0.0) / 100.0),
                 pct((to_float(context.get("btc_volatility_pct")) or 0.0) / 100.0),
@@ -1125,9 +1147,9 @@ def render_market_context_table(events: list[dict[str, Any]]) -> str:
     if not rows:
         return empty_block("자동 수집 시장 데이터가 아직 없습니다. 다음 후보 스캔부터 기록됩니다.")
     return render_simple_table(
-        ["시간", "진입", "점수 조정", "BTC 모멘텀", "BTC 변동성", "공포탐욕", "글로벌 시총 24h", "BTC 점유율", "Binance BTC 24h", "요약"],
+        ["시간", "진입", "시장 모드", "시장 세션", "점수 조정", "BTC 모멘텀", "BTC 변동성", "공포탐욕", "글로벌 시총 24h", "BTC 점유율", "Binance BTC 24h", "요약"],
         rows,
-        text_cols={9},
+        text_cols={2, 3, 11},
         num_cols={2, 3, 4, 6, 7, 8},
     )
 
