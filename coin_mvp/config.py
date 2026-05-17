@@ -28,6 +28,8 @@ class StrategyConfig:
     btc_long_window: int = 20
     min_btc_momentum_pct: float = -0.7
     min_expected_upside_pct: float = 0.8
+    min_validated_recovery_pct: float = 0.08
+    min_net_edge_pct: float = 0.35
     target_upside_pct: float = 3.0
     blocked_entry_hours_kst: tuple[int, ...] = ()
     reentry_cooldown_ticks: int = 6
@@ -86,6 +88,7 @@ class RiskConfig:
     max_total_position_fraction: float = 0.95
     max_new_entries_per_tick: int = 1
     min_trade_cash_krw: float = 0.0
+    min_candidate_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,8 @@ def load_config(path: str | Path) -> AppConfig:
             btc_long_window=int(strategy.get("btc_long_window", strategy.get("long_window", 20))),
             min_btc_momentum_pct=float(strategy.get("min_btc_momentum_pct", -0.7)),
             min_expected_upside_pct=float(strategy.get("min_expected_upside_pct", 0.8)),
+            min_validated_recovery_pct=float(strategy.get("min_validated_recovery_pct", 0.08)),
+            min_net_edge_pct=float(strategy.get("min_net_edge_pct", 0.35)),
             target_upside_pct=float(strategy.get("target_upside_pct", risk.get("daily_profit_target_pct", 3.0))),
             blocked_entry_hours_kst=tuple(int(value) for value in strategy.get("blocked_entry_hours_kst", [])),
             reentry_cooldown_ticks=int(strategy.get("reentry_cooldown_ticks", 6)),
@@ -214,6 +219,7 @@ def load_config(path: str | Path) -> AppConfig:
             max_total_position_fraction=float(risk.get("max_total_position_fraction", 0.95)),
             max_new_entries_per_tick=int(risk.get("max_new_entries_per_tick", 1)),
             min_trade_cash_krw=float(risk.get("min_trade_cash_krw", 0.0)),
+            min_candidate_score=float(risk.get("min_candidate_score", 0.0)),
         ),
         ai_decision=AiDecisionConfig(
             enabled=bool(ai_decision.get("enabled", True)),
@@ -281,6 +287,10 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("time_stop_ticks must not be negative.")
     if config.strategy.min_expected_upside_pct < 0:
         raise ValueError("min_expected_upside_pct must not be negative.")
+    if config.strategy.min_validated_recovery_pct < 0:
+        raise ValueError("min_validated_recovery_pct must not be negative.")
+    if config.strategy.min_net_edge_pct < 0:
+        raise ValueError("min_net_edge_pct must not be negative.")
     if config.strategy.target_upside_pct <= 0:
         raise ValueError("target_upside_pct must be positive.")
     if any(hour < 0 or hour > 23 for hour in config.strategy.blocked_entry_hours_kst):
@@ -367,6 +377,8 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_new_entries_per_tick must be at least 1.")
     if config.risk.min_trade_cash_krw < 0:
         raise ValueError("min_trade_cash_krw must not be negative.")
+    if config.risk.min_candidate_score < 0:
+        raise ValueError("min_candidate_score must not be negative.")
     if config.risk.halt_cooldown_ticks < 0:
         raise ValueError("halt_cooldown_ticks must not be negative.")
     if config.risk.consecutive_loss_cooldown_ticks < 0:

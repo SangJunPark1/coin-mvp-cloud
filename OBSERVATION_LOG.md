@@ -89,3 +89,46 @@ Evaluation rules for this update:
 - If it reaches 30 completed trades and expectancy remains below 0, adjust exits before adding more entries.
 - If it reaches 60 completed trades and payoff ratio remains below 1.0, redesign target/stop logic.
 - If drawdown reaches -7% before 60 completed trades, reduce position fraction before changing entry filters.
+
+## 2026-05-17 Conviction Sizing Reset
+
+Source: user report screenshot after extended cloud paper run.
+
+- Equity: 915,462 KRW
+- Cumulative return: -8.5%
+- Completed trades: 156
+- Win rate: 35.9%
+- Payoff ratio: 0.81x
+- Expectancy: -443 KRW
+- Max drawdown: -75,040 KRW
+- Open positions: 0
+
+Observed problems:
+
+- Sample size is now large enough to conclude the previous strategy is structurally negative.
+- Exit attribution shows positive partial exits, but stop-loss and trend-exit groups dominate total loss.
+- Trade size around the 180k-220k KRW range was too small to make winning trades matter after fees, while losses still accumulated.
+- The bot was active, but activity quality was not high enough.
+
+Applied tuning direction:
+
+- Move from many small exploratory entries to fewer conviction entries.
+- Raise position fraction and minimum cash per trade so each valid entry is meaningful.
+- Keep the absolute daily entry cap high and let situational controls decide whether entries are acceptable.
+- Add a candidate-score floor so weak setups are skipped even when filters technically allow them.
+- Raise the candidate-score floor dynamically when drawdown, consecutive losses, or heavy same-day activity appear.
+- Reduce position size dynamically during drawdown or after consecutive losses instead of fully stopping by a fixed entry count.
+- Add a validated-recovery gate so rebound entries require actual price recovery, stronger close position, and volume confirmation.
+- Add a net-edge gate so expected upside must remain meaningfully positive after estimated downside, fees, and slippage.
+- Penalize candidate scores when expected downside is high, instead of ranking only by confidence and upside.
+- Tighten stop-loss and dynamic downside so bad entries are cut earlier.
+- Let small trend-break losses breathe until stop-loss or time-stop, instead of closing every weak trend break immediately.
+- Require stronger expected upside, volume, orderbook, and breadth before deploying larger capital.
+
+Next evaluation thresholds:
+
+- Do not judge before 20 completed exits on the new version.
+- First review at 30 completed exits.
+- Stronger read at 50 completed exits.
+- If expectancy remains negative after 50 exits, change the entry thesis, not just sizing.
+- If max drawdown reaches -3% from the new deployment equity before 30 exits, reduce size immediately.

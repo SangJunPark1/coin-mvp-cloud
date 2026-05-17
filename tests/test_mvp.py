@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -604,6 +605,111 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         self.assertEqual(suppressed.side, Side.HOLD)
         self.assertIn("bollinger rebound grace active", suppressed.reason)
+
+    def test_validated_recovery_rejects_flat_rebound(self):
+        app = make_test_app()
+        candles = make_candles([100.0] * 20, volume=10.0)
+        signal = Signal(Side.BUY, "bollinger rebound setup", 100.0, 0.7)
+
+        ok, reason = app._validated_recovery_ok(candles, signal)
+
+        self.assertFalse(ok)
+        self.assertIn("validated recovery blocked", reason)
+
+    def test_validated_recovery_accepts_confirmed_recovery(self):
+        app = make_test_app()
+        closes = [100, 99.8, 99.6, 99.4, 99.2, 99.0, 98.8, 98.6, 98.4, 98.2, 98.0, 98.1, 98.2, 98.3, 98.4, 98.5, 98.7, 98.9, 99.1, 99.4]
+        candles = make_variable_candles(closes, [10.0] * 19 + [18.0])
+        signal = Signal(Side.BUY, "bollinger rebound setup", 99.4, 0.7)
+
+        ok, reason = app._validated_recovery_ok(candles, signal)
+
+        self.assertTrue(ok)
+        self.assertIn("validated recovery ok", reason)
+
+    def test_bollinger_filter_failure_is_penalty_not_hard_block(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(
+                app.config.strategy,
+                enable_bollinger_rebound_filter=True,
+                bollinger_filter_penalty=0.04,
+            ),
+        )
+        app.data_source.get_orderbook_snapshot = lambda *_args, **_kwargs: OrderbookSnapshot(
+            market="KRW-BTC",
+            timestamp=datetime(2026, 4, 20, tzinfo=timezone.utc),
+            best_bid_price=99.96,
+            best_bid_size=1.0,
+            best_ask_price=100.04,
+            best_ask_size=1.0,
+            total_bid_size=10.0,
+            total_ask_size=9.5,
+        )
+        app._five_minute_trend_ok = lambda _market: (True, "5m trend ok", 0.0)
+        app._multi_timeframe_bollinger_ok = lambda _market: (False, "15m bollinger filter blocked", 0.0)
+
+        blocked, reason, penalty = app._entry_market_filters(1, "KRW-BTC", make_candles([100.0] * 20, volume=10.0))
+
+        self.assertFalse(blocked)
+        self.assertIn("bollinger filter blocked", reason)
+        self.assertGreaterEqual(penalty, 0.08)
+
+    def test_candidate_score_floor_rises_after_losses_and_drawdown(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="neutral",
+        )
+        app.config = AppConfig(
+            mode=app.config.mode,
+            market=app.config.market,
+            poll_seconds=app.config.poll_seconds,
+            starting_cash=app.config.starting_cash,
+            fee_rate=app.config.fee_rate,
+            slippage_bps=app.config.slippage_bps,
+            strategy=app.config.strategy,
+            risk=RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=5.0,
+                max_entries_per_day=48,
+                max_position_fraction=0.42,
+                max_consecutive_losses=4,
+                min_candidate_score=0.62,
+            ),
+            ai_decision=app.config.ai_decision,
+            paths=app.config.paths,
+        )
+        app.risk.config = app.config.risk
+        app.risk.state.consecutive_losses = 2
+        app.risk.state.entries_today = 13
+
+        floor = app._candidate_score_floor(context, equity=985_000)
+
+        self.assertGreater(floor, 0.9)
+
+    def test_drawdown_and_losses_reduce_position_fraction(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="neutral",
+        )
+        candles = make_candles([100, 101, 102, 103, 104, 105], volume=10.0)
+        app.risk.state.consecutive_losses = 2
+
+        reduced = app._position_fraction_for_context(candles, context, equity=985_000)
+        normal = app._position_fraction_for_context(candles, context, equity=1_000_000)
+
+        self.assertLess(reduced, normal)
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:
