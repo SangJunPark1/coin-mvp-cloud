@@ -9,6 +9,7 @@ from typing import Any
 from .config import StrategyConfig
 from .data import UpbitPublicDataSource
 from .models import Candle
+from .news import fetch_crypto_news_signal
 from .strategy import recent_volatility_pct
 
 KST = timezone(timedelta(hours=9))
@@ -32,6 +33,10 @@ class DecisionContext:
     btc_dominance_pct: float | None = None
     binance_btcusdt_change_pct: float | None = None
     binance_btcusdt_quote_volume: float | None = None
+    news_sentiment_score: float | None = None
+    news_risk_headline_count: int = 0
+    news_positive_headline_count: int = 0
+    news_headlines: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -45,6 +50,7 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
     tx_count = fetch_blockchain_tx_count()
     global_change, btc_dominance = fetch_coingecko_global()
     binance_change, binance_quote_volume = fetch_binance_btcusdt_24h()
+    news_signal = fetch_news_signal()
     session_label, session_bias = current_session_label()
 
     allows = True
@@ -86,6 +92,16 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
             reasons.append("global BTC pair weak")
         elif binance_change > 1.0:
             mode_score += 0.5
+    if news_signal is not None:
+        reasons.append(
+            f"news sentiment {news_signal.sentiment_score:.2f} "
+            f"({news_signal.positive_headline_count}+/{news_signal.risk_headline_count}-)"
+        )
+        if news_signal.risk_headline_count >= 3 and news_signal.sentiment_score < -0.15:
+            mode_score -= 0.7
+            reasons.append("news risk elevated")
+        elif news_signal.sentiment_score > 0.15:
+            mode_score += 0.35
 
     market_mode, mode_multiplier, position_multiplier = classify_market_mode(mode_score, btc_momentum, global_change, binance_change)
     if market_mode == "capital_protect":
@@ -110,7 +126,18 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
         btc_dominance_pct=btc_dominance,
         binance_btcusdt_change_pct=binance_change,
         binance_btcusdt_quote_volume=binance_quote_volume,
+        news_sentiment_score=news_signal.sentiment_score if news_signal is not None else None,
+        news_risk_headline_count=news_signal.risk_headline_count if news_signal is not None else 0,
+        news_positive_headline_count=news_signal.positive_headline_count if news_signal is not None else 0,
+        news_headlines=news_signal.latest_headlines if news_signal is not None else None,
     )
+
+
+def fetch_news_signal():
+    try:
+        return fetch_crypto_news_signal(timeout_seconds=3, max_items=10)
+    except Exception:
+        return None
 
 
 def current_session_label(now: datetime | None = None) -> tuple[str, float]:

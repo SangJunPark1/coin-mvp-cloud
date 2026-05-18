@@ -20,6 +20,8 @@ class MarketDataSource(Protocol):
 class UpbitPublicDataSource:
     """Public Upbit candle reader. It never authenticates or places orders."""
 
+    EXCLUDED_TRADING_MARKETS = {"KRW-USDT", "KRW-USDC"}
+
     def __init__(self, unit_minutes: int = 1, timeout_seconds: int = 10) -> None:
         self.unit_minutes = unit_minutes
         self.timeout_seconds = timeout_seconds
@@ -77,6 +79,7 @@ class UpbitPublicDataSource:
             tickers.extend(self._read_json(url))
         if min_trade_price_krw > 0:
             tickers = [row for row in tickers if float(row.get("trade_price", 0.0)) >= min_trade_price_krw]
+        tickers = [row for row in tickers if str(row.get("market", "")) not in self.EXCLUDED_TRADING_MARKETS]
         tickers.sort(key=lambda row: float(row.get("acc_trade_price_24h", 0.0)), reverse=True)
         return [str(row["market"]) for row in tickers[:count]]
 

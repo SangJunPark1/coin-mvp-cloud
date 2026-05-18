@@ -8,8 +8,9 @@ from typing import Any
 
 from .config import AiDecisionConfig, StrategyConfig
 from .market_context import DecisionContext
+from .ml_decision import score_entry_with_feature_model
 from .models import Candle, Signal
-from .strategy import estimate_expected_downside_pct, estimate_expected_upside_pct, recent_volatility_pct
+from .strategy import estimate_expected_downside_pct, estimate_signal_expected_upside_pct, recent_volatility_pct
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ def review_entry_candidate(
 
     expected_upside = float(decision_input["candidate"]["expected_upside_pct"])
     expected_downside = estimate_expected_downside_pct(candles, strategy.stop_loss_pct, strategy.stop_volatility_multiplier)
+    model_score = score_entry_with_feature_model(decision_input)
     risk_notes: list[str] = []
 
     if not ai_config.enabled:
@@ -68,7 +70,7 @@ def review_entry_candidate(
             input_snapshot=decision_input,
         )
 
-    confidence = min(0.95, max(0.0, signal.confidence) * context.score_multiplier)
+    confidence = min(0.95, max(0.0, signal.confidence + model_score.confidence_adjustment) * context.score_multiplier)
     if expected_upside < strategy.min_expected_upside_pct:
         risk_notes.append("Expected upside is below the configured minimum.")
     if expected_downside >= expected_upside:
@@ -79,6 +81,7 @@ def review_entry_candidate(
         risk_notes.append("Market stress is high.")
     if not context.allows_entries:
         risk_notes.append("Market context does not allow new entries.")
+    risk_notes.extend(model_score.notes)
     if fallback_reason:
         risk_notes.append(f"OpenAI fallback reason: {fallback_reason}")
 
@@ -93,12 +96,15 @@ def review_entry_candidate(
     elif risk_notes and confidence < ai_config.min_confidence + 0.15:
         action = "hold"
         thesis = "Candidate has a deterministic signal, but the risk/reward evidence is not strong enough."
-    elif confidence < ai_config.min_confidence or grade != "A":
+    elif model_score.probability < 0.53:
+        action = "hold"
+        thesis = "Local feature model score is too weak for a new entry."
+    elif confidence < ai_config.min_confidence or grade == "C":
         action = "hold"
         thesis = "Candidate grade is below the entry threshold."
     else:
         action = "buy"
-        thesis = "Candidate has trend, volume, upside, and market-context evidence above the entry threshold."
+        thesis = "Candidate has strategy, market, news, and feature-model evidence above the entry threshold."
 
     return DecisionReview(
         action=action,
@@ -110,7 +116,7 @@ def review_entry_candidate(
         expected_downside_pct=expected_downside,
         risk_notes=risk_notes,
         source=fallback_source,
-        input_snapshot=decision_input,
+        input_snapshot={**decision_input, "local_model": model_score.to_dict()},
     )
 
 
@@ -132,7 +138,7 @@ def build_decision_input(
             "signal_side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
             "signal_reason": signal.reason,
             "signal_confidence": signal.confidence,
-            "expected_upside_pct": estimate_expected_upside_pct(candles, strategy.target_upside_pct),
+            "expected_upside_pct": estimate_signal_expected_upside_pct(candles, signal, strategy),
             "expected_downside_pct": estimate_expected_downside_pct(candles, strategy.stop_loss_pct, strategy.stop_volatility_multiplier),
             "recent_high": recent_high,
             "recent_low": recent_low,

@@ -21,7 +21,7 @@ from .strategy import (
     btc_regime_allows_entries,
     calculate_ema,
     estimate_expected_downside_pct,
-    estimate_expected_upside_pct,
+    estimate_signal_expected_upside_pct,
     latest_volume_ratio,
     market_breadth_ratio,
     mean,
@@ -163,13 +163,17 @@ class MultiMarketTradingApp:
                     if len(blocked_samples) < 20:
                         blocked_samples.append({"market": market, "reason": recovery_reason, "price": candles[-1].close})
                     continue
-                rr_ok, rr_reason = self._reward_risk_ok(candles)
+                rr_ok, rr_reason = self._reward_risk_ok(candles, signal)
                 if not rr_ok:
                     blocked_reasons[rr_reason] = blocked_reasons.get(rr_reason, 0) + 1
                     if len(blocked_samples) < 20:
                         blocked_samples.append({"market": market, "reason": rr_reason, "price": candles[-1].close})
                     continue
-                penalty = self._recent_stopout_penalty(market, tick) + filter_penalty + trend_screen_penalty
+                penalty = (
+                    self._recent_stopout_penalty(market, tick)
+                    + self._entry_filter_penalty_for_signal(signal, filter_reason, filter_penalty)
+                    + trend_screen_penalty
+                )
                 candidates.append((candidate_score(candles, signal, self.config.strategy, penalty=penalty) * context.score_multiplier, market, candles, signal))
             else:
                 reason = signal.reason
@@ -194,7 +198,7 @@ class MultiMarketTradingApp:
             candles_by_market,
             self.config.strategy.short_window,
             self.config.strategy.long_window,
-            self.config.strategy.long_trend_ema_window or self.config.strategy.long_window,
+            self.config.strategy.long_window,
         )
         breadth_penalty = 0.0
         if breadth_ratio < self.config.strategy.min_market_breadth_ratio:
@@ -220,7 +224,7 @@ class MultiMarketTradingApp:
 
         candidates.sort(key=lambda item: item[0], reverse=True)
         adjusted_candidates = [
-            (score - breadth_penalty, market, candles, signal)
+            (score - self._breadth_penalty_for_candidate(score, signal, breadth_penalty), market, candles, signal)
             for score, market, candles, signal in candidates
         ]
         adjusted_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -368,8 +372,6 @@ class MultiMarketTradingApp:
         if orderbook.spread_bps > spread_limit:
             spread_penalty = orderbook_spread_penalty(orderbook.spread_bps, spread_limit)
         imbalance_limit = self.config.strategy.min_orderbook_imbalance
-        if orderbook.imbalance_ratio < max(0.0, imbalance_limit - 0.25):
-            return True, f"weak orderbook imbalance: {orderbook.imbalance_ratio:.2f}", 0.0
         imbalance_penalty = 0.0
         if orderbook.imbalance_ratio < imbalance_limit:
             imbalance_penalty = orderbook_imbalance_penalty(orderbook.imbalance_ratio, imbalance_limit)
@@ -394,8 +396,8 @@ class MultiMarketTradingApp:
         reason = "; ".join(reasons) if reasons else mtf_reason
         return False, reason, total_penalty
 
-    def _reward_risk_ok(self, candles: list[Candle]) -> tuple[bool, str]:
-        expected_upside = estimate_expected_upside_pct(candles, self.config.strategy.target_upside_pct)
+    def _reward_risk_ok(self, candles: list[Candle], signal: Signal) -> tuple[bool, str]:
+        expected_upside = estimate_signal_expected_upside_pct(candles, signal, self.config.strategy)
         expected_downside = estimate_expected_downside_pct(
             candles,
             self.config.strategy.stop_loss_pct,
@@ -408,9 +410,10 @@ class MultiMarketTradingApp:
         if net_edge < self.config.strategy.min_net_edge_pct:
             return False, f"reward-risk blocked: net edge {net_edge:.2f}% < {self.config.strategy.min_net_edge_pct:.2f}%"
         downside_to_upside = expected_downside / expected_upside
-        if downside_to_upside > self.config.risk.max_expected_downside_to_upside_ratio:
+        max_downside_to_upside = self._max_downside_to_upside_for_signal(signal)
+        if downside_to_upside > max_downside_to_upside:
             reward_risk = expected_upside / expected_downside if expected_downside > 0 else 999.0
-            required = 1.0 / self.config.risk.max_expected_downside_to_upside_ratio
+            required = 1.0 / max_downside_to_upside
             return False, f"reward-risk blocked: {reward_risk:.2f}R < {required:.2f}R"
         return True, f"reward-risk ok: upside {expected_upside:.2f}%, downside {expected_downside:.2f}%, net edge {net_edge:.2f}%"
 
@@ -430,12 +433,35 @@ class MultiMarketTradingApp:
         close_position = 1.0 if candle_range <= 0 else (latest.close - latest.low) / candle_range
         recovered_price = latest.close >= short_ma or latest.close >= previous.close
         strong_recovery = recovery_momentum >= self.config.strategy.min_validated_recovery_pct or one_candle_recovery >= self.config.strategy.min_validated_recovery_pct
+        if "trend breakout setup" in signal.reason:
+            if volume_ratio < max(0.8, self.config.strategy.min_volume_ratio * 0.8):
+                return False, f"validated recovery blocked: trend volume {volume_ratio:.2f}x"
+            if close_position < 0.40:
+                return False, f"validated recovery blocked: weak trend close position {close_position:.2f}"
+            return True, (
+                f"validated trend ok: recovery {recovery_momentum:.2f}%, "
+                f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
+            )
+        if "micro recovery setup" in signal.reason:
+            if not recovered_price and one_candle_recovery < -0.03:
+                return False, (
+                    "validated recovery blocked: "
+                    f"micro recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
+                )
+            if volume_ratio < max(0.78, self.config.strategy.min_volume_ratio * 0.78):
+                return False, f"validated recovery blocked: micro volume {volume_ratio:.2f}x"
+            if close_position < 0.42:
+                return False, f"validated recovery blocked: weak micro close position {close_position:.2f}"
+            return True, (
+                f"validated micro recovery ok: recovery {recovery_momentum:.2f}%, "
+                f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
+            )
         if not recovered_price or not strong_recovery:
             return False, (
                 "validated recovery blocked: "
                 f"recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
             )
-        if latest.close < long_ma * 0.985 and "uptrend filter passed" in signal.reason:
+        if latest.close < long_ma * 0.985 and "trend breakout setup" in signal.reason:
             return False, "validated recovery blocked: trend entry below long MA buffer"
         if volume_ratio < self.config.strategy.min_volume_ratio:
             return False, f"validated recovery blocked: volume {volume_ratio:.2f}x"
@@ -456,10 +482,38 @@ class MultiMarketTradingApp:
         multiplier = float(getattr(context, "position_fraction_multiplier", 1.0) or 1.0)
         multiplier *= self._drawdown_exposure_multiplier(equity)
         if self.risk.state.consecutive_losses >= 2:
-            multiplier *= 0.55
+            multiplier *= 0.7
         elif self.risk.state.consecutive_losses == 1:
-            multiplier *= 0.75
+            multiplier *= 0.85
         return max(0.0, base * multiplier)
+
+    def _max_downside_to_upside_for_signal(self, signal: Signal) -> float:
+        reason = signal.reason.lower()
+        configured = self.config.risk.max_expected_downside_to_upside_ratio
+        if "trend breakout setup" in reason:
+            return max(configured, 0.72)
+        if "pullback continuation setup" in reason:
+            return max(configured, 0.68)
+        if "micro recovery setup" in reason:
+            return max(configured, 0.62)
+        return configured
+
+    def _entry_filter_penalty_for_signal(self, signal: Signal, filter_reason: str, filter_penalty: float) -> float:
+        if filter_penalty <= 0:
+            return 0.0
+        if "trend breakout setup" in signal.reason and "bollinger filter blocked" in filter_reason:
+            bollinger_failure_penalty = max(self.config.strategy.bollinger_filter_penalty, 0.08)
+            return max(0.0, filter_penalty - bollinger_failure_penalty)
+        return filter_penalty
+
+    def _breadth_penalty_for_candidate(self, score: float, signal: Signal, breadth_penalty: float) -> float:
+        if breadth_penalty <= 0:
+            return 0.0
+        if signal.confidence >= 0.72 and score >= self.config.risk.min_candidate_score + 0.14:
+            return breadth_penalty * 0.35
+        if signal.confidence >= 0.64 and score >= self.config.risk.min_candidate_score + 0.08:
+            return breadth_penalty * 0.6
+        return breadth_penalty
 
     def _max_new_entries_for_context(self, context) -> int:
         configured = max(1, self.config.risk.max_new_entries_per_tick)
@@ -479,13 +533,13 @@ class MultiMarketTradingApp:
             return 999.0
         drawdown_pct = self._period_drawdown_pct(equity)
         if drawdown_pct <= -1.5:
-            base += 0.16
+            base += 0.10
         elif drawdown_pct <= -0.8:
-            base += 0.08
+            base += 0.05
         if self.risk.state.consecutive_losses >= 2:
-            base += 0.18
+            base += 0.12
         elif self.risk.state.consecutive_losses == 1:
-            base += 0.08
+            base += 0.05
         if self.risk.state.entries_today >= 24:
             base += 0.12
         elif self.risk.state.entries_today >= 12:
@@ -500,9 +554,9 @@ class MultiMarketTradingApp:
     def _drawdown_exposure_multiplier(self, equity: float | None) -> float:
         drawdown_pct = self._period_drawdown_pct(equity)
         if drawdown_pct <= -1.5:
-            return 0.55
+            return 0.7
         if drawdown_pct <= -0.8:
-            return 0.75
+            return 0.85
         if drawdown_pct >= 1.0:
             return 1.08
         return 1.0
@@ -513,14 +567,10 @@ class MultiMarketTradingApp:
         if "bollinger lower rebound" not in filter_reason:
             return fallback
         latest_price = candles[-1].close
-        expected_upside_pct = estimate_expected_upside_pct(candles, self.config.strategy.target_upside_pct)
+        expected_upside_pct = estimate_signal_expected_upside_pct(candles, fallback, self.config.strategy)
         if expected_upside_pct < self.config.strategy.bollinger_min_expected_upside_pct:
-            return Signal(
-                Side.HOLD,
-                f"bollinger rebound blocked: expected upside {expected_upside_pct:.2f}%",
-                latest_price,
-                0.2,
-            )
+            reason = f"{fallback.reason}; bollinger rebound skipped: expected upside {expected_upside_pct:.2f}%"
+            return Signal(fallback.side, reason, latest_price, fallback.confidence, fallback.size_fraction)
         confidence = min(0.74, 0.58 + min(expected_upside_pct / 30.0, 0.08))
         return Signal(
             Side.BUY,
@@ -538,7 +588,10 @@ class MultiMarketTradingApp:
         long_ma = mean(closes[-self.config.strategy.long_window :])
         long_trend_ema = calculate_ema(closes, self.config.strategy.long_trend_ema_window)
         if long_trend_ema is not None and latest_price < long_trend_ema:
-            return f"universe trend penalty: below EMA{self.config.strategy.long_trend_ema_window}", 0.16
+            ema_gap_pct = ((latest_price / long_trend_ema) - 1.0) * 100.0 if long_trend_ema > 0 else 0.0
+            if ema_gap_pct < -2.0:
+                return f"universe trend penalty: deeply below EMA{self.config.strategy.long_trend_ema_window}", 0.16
+            return f"universe trend penalty: below EMA{self.config.strategy.long_trend_ema_window} {ema_gap_pct:.2f}%", 0.06
         if short_ma <= long_ma:
             return f"universe trend penalty: short {short_ma:.3f} <= long {long_ma:.3f}", 0.14
         if latest_price <= long_ma:
@@ -617,9 +670,16 @@ class MultiMarketTradingApp:
                 0.85,
                 size_fraction=self.config.strategy.partial_take_profit_fraction,
             )
-        if pnl_pct >= self.config.strategy.breakeven_trigger_pct and latest_price <= avg_price:
-            return Signal(Side.SELL, f"breakeven stop reached: {pnl_pct:.2f}%", latest_price, 0.8)
         peak_price = max(position.peak_price, latest_price)
+        peak_pnl_pct = (peak_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
+        breakeven_floor_pct = self._roundtrip_cost_pct() * 0.75
+        if peak_pnl_pct >= self.config.strategy.breakeven_trigger_pct and pnl_pct <= breakeven_floor_pct:
+            return Signal(
+                Side.SELL,
+                f"breakeven stop reached: peak {peak_pnl_pct:.2f}%, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.82,
+            )
         peak_drawdown_pct = (latest_price / peak_price - 1.0) * 100.0 if peak_price > 0 else 0.0
         if pnl_pct > 0 and peak_drawdown_pct <= -self.config.strategy.trailing_stop_pct:
             return Signal(Side.SELL, f"trailing stop reached: {peak_drawdown_pct:.2f}%", latest_price, 0.75)
@@ -880,7 +940,7 @@ def candidate_score(candles: list[Candle], signal: Signal, config: StrategyConfi
     momentum = (closes[-1] / closes[-5] - 1.0) if len(closes) >= 5 and closes[-5] else 0.0
     volume_value = candles[-1].close * candles[-1].volume
     pullback_risk = max(0.0, (max(closes[-5:]) / closes[-1] - 1.0)) if len(closes) >= 5 and closes[-1] else 0.0
-    expected_upside = estimate_expected_upside_pct(candles, target_upside_pct=config.target_upside_pct) / 100.0
+    expected_upside = estimate_signal_expected_upside_pct(candles, signal, config) / 100.0
     expected_downside = estimate_expected_downside_pct(candles, config.stop_loss_pct, config.stop_volatility_multiplier) / 100.0
     net_edge = expected_upside - expected_downside
     return (

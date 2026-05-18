@@ -37,9 +37,15 @@ class MovingAverageStrategy:
                 return Signal(Side.SELL, "trend break", latest_price, 0.6)
             return Signal(Side.HOLD, "position open, no exit condition", latest_price, 0.2)
 
-        entry_ok, entry_reason, confidence = self._entry_quality(candles, short_ma, long_ma)
-        if short_ma > long_ma and latest_price > long_ma and entry_ok:
-            return Signal(Side.BUY, entry_reason, latest_price, confidence)
+        trend_signal = self._trend_breakout_signal(candles, short_ma, long_ma)
+        if trend_signal is not None:
+            return trend_signal
+        pullback_signal = self._pullback_continuation_signal(candles, short_ma, long_ma)
+        if pullback_signal is not None:
+            return pullback_signal
+        micro_signal = self._micro_recovery_signal(candles, short_ma, long_ma)
+        if micro_signal is not None:
+            return micro_signal
         range_signal, range_reason = self._range_rebound_signal(candles, short_ma, long_ma)
         if range_signal is not None:
             return range_signal
@@ -73,9 +79,67 @@ class MovingAverageStrategy:
                 latest_price,
                 0.1,
             )
-        return Signal(Side.HOLD, self._combine_hold_reasons(entry_reason, range_reason), latest_price, 0.1)
+        _, trend_reason, _ = self._trend_entry_quality(candles, short_ma, long_ma)
+        return Signal(Side.HOLD, self._combine_hold_reasons(trend_reason, range_reason), latest_price, 0.1)
 
-    def _entry_quality(self, candles: list[Candle], short_ma: float, long_ma: float) -> tuple[bool, str, float]:
+    def _trend_breakout_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        closes = [c.close for c in candles]
+        latest_price = closes[-1]
+        if short_ma <= long_ma or latest_price <= long_ma:
+            return None
+        ok, reason, confidence = self._trend_entry_quality(candles, short_ma, long_ma)
+        if not ok:
+            return None
+        return Signal(Side.BUY, reason, latest_price, confidence)
+
+    def _pullback_continuation_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        closes = [c.close for c in candles]
+        latest_price = closes[-1]
+        if len(closes) < max(8, self.config.long_window):
+            return None
+        trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
+        if trend_strength <= 0.05:
+            return None
+        recent = candles[-6:]
+        recent_low = min(candle.low for candle in recent)
+        pullback_depth_pct = ((short_ma / recent_low) - 1.0) * 100.0 if recent_low > 0 else 0.0
+        reclaim_pct = ((latest_price / recent_low) - 1.0) * 100.0 if recent_low > 0 else 0.0
+        volume_ratio = latest_volume_ratio(candles, lookback=10)
+        rsi = calculate_rsi(closes, self.config.rsi_period)
+        expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
+        if latest_price < long_ma * 0.995:
+            return None
+        if latest_price < short_ma * 0.997:
+            return None
+        if pullback_depth_pct < 0.12 or reclaim_pct < self.config.min_validated_recovery_pct:
+            return None
+        if volume_ratio < max(0.85, self.config.min_volume_ratio * 0.9):
+            return None
+        if expected_upside_pct < max(0.55, self.config.min_expected_upside_pct * 0.55):
+            return None
+        if rsi is not None and rsi > min(78.0, self.config.max_entry_rsi + 4.0):
+            return None
+        confidence = min(
+            0.82,
+            0.50
+            + min(trend_strength / 12.0, 0.12)
+            + min(reclaim_pct / 4.0, 0.08)
+            + min(volume_ratio - 0.9, 0.12)
+            + min(expected_upside_pct / 20.0, 0.08),
+        )
+        rsi_text = f"; RSI {rsi:.1f}" if rsi is not None else ""
+        return Signal(
+            Side.BUY,
+            (
+                "pullback continuation setup: "
+                f"trend {trend_strength:.2f}%; reclaim {reclaim_pct:.2f}%; "
+                f"volume {volume_ratio:.2f}x; expected follow-through {expected_upside_pct:.2f}%{rsi_text}"
+            ),
+            latest_price,
+            confidence,
+        )
+
+    def _trend_entry_quality(self, candles: list[Candle], short_ma: float, long_ma: float) -> tuple[bool, str, float]:
         closes = [c.close for c in candles]
         latest_price = closes[-1]
         lookback = min(5, len(closes) - 1)
@@ -85,16 +149,11 @@ class MovingAverageStrategy:
         rsi = calculate_rsi(closes, self.config.rsi_period)
         long_trend_ema = calculate_ema(closes, self.config.long_trend_ema_window)
 
-        if self.config.long_trend_ema_window and long_trend_ema is None:
-            return False, "long trend filter blocked: not enough candles", 0.2
-        if long_trend_ema is not None and latest_price < long_trend_ema:
-            return False, f"long trend filter blocked: price below EMA{self.config.long_trend_ema_window}", 0.2
-
         if recent_momentum_pct < self.config.min_recent_momentum_pct:
             return False, f"weak recent momentum: {recent_momentum_pct:.2f}%", 0.2
         if recent_momentum_pct > self.config.max_recent_momentum_pct or ma_distance_pct > self.config.max_ma_distance_pct:
             return False, f"overextended: momentum {recent_momentum_pct:.2f}%, distance {ma_distance_pct:.2f}%", 0.2
-        expected_upside_pct = estimate_expected_upside_pct(candles, self.config.target_upside_pct)
+        expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
         if expected_upside_pct < self.config.min_expected_upside_pct:
             return False, f"insufficient upside: expected {expected_upside_pct:.2f}%", 0.2
         if rsi is not None and rsi > self.config.max_entry_rsi:
@@ -103,10 +162,67 @@ class MovingAverageStrategy:
             return False, f"thin volume: {volume_ratio:.2f}x", 0.2
 
         trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
-        confidence = min(0.95, 0.55 + (trend_strength / 20.0) + min(volume_ratio - 1.0, 0.3) + min(expected_upside_pct / 20.0, 0.1))
+        ema_penalty = 0.0
+        ema_text = ""
+        if long_trend_ema is not None:
+            ema_gap_pct = ((latest_price / long_trend_ema) - 1.0) * 100.0 if long_trend_ema > 0 else 0.0
+            if ema_gap_pct < -1.8:
+                return False, f"long trend filter blocked: price deeply below EMA{self.config.long_trend_ema_window}", 0.2
+            if ema_gap_pct < 0:
+                ema_penalty = min(0.08, abs(ema_gap_pct) / 30.0)
+                ema_text = f"; below EMA{self.config.long_trend_ema_window} {ema_gap_pct:.2f}%"
+            else:
+                ema_text = f"; above EMA{self.config.long_trend_ema_window}"
+        confidence = min(0.95, 0.55 + (trend_strength / 20.0) + min(volume_ratio - 1.0, 0.3) + min(expected_upside_pct / 20.0, 0.1) - ema_penalty)
         rsi_text = f"; RSI {rsi:.1f}" if rsi is not None else ""
-        ema_text = f"; above EMA{self.config.long_trend_ema_window}" if long_trend_ema is not None else ""
-        return True, f"uptrend filter passed; momentum {recent_momentum_pct:.2f}%; volume {volume_ratio:.2f}x; expected upside {expected_upside_pct:.2f}%{rsi_text}{ema_text}", confidence
+        return True, f"trend breakout setup: momentum {recent_momentum_pct:.2f}%; volume {volume_ratio:.2f}x; expected follow-through {expected_upside_pct:.2f}%{rsi_text}{ema_text}", confidence
+
+    def _micro_recovery_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        closes = [c.close for c in candles]
+        latest_price = closes[-1]
+        if len(closes) < max(8, self.config.long_window):
+            return None
+        previous_price = closes[-2]
+        lookback = min(5, len(closes) - 1)
+        recent_momentum_pct = ((latest_price / closes[-1 - lookback]) - 1.0) * 100.0 if closes[-1 - lookback] > 0 else 0.0
+        one_candle_pct = ((latest_price / previous_price) - 1.0) * 100.0 if previous_price > 0 else 0.0
+        volume_ratio = latest_volume_ratio(candles, lookback=10)
+        rsi = calculate_rsi(closes, self.config.rsi_period)
+        candle_range = candles[-1].high - candles[-1].low
+        close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
+        expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
+        price_near_ma = latest_price >= long_ma * 0.992 or latest_price >= short_ma * 0.996
+        stabilizing = one_candle_pct >= -0.03 and recent_momentum_pct >= -0.35
+        if not price_near_ma or not stabilizing:
+            return None
+        if close_position < 0.42:
+            return None
+        if volume_ratio < max(0.78, self.config.min_volume_ratio * 0.78):
+            return None
+        if expected_upside_pct < 0.45:
+            return None
+        if rsi is not None and not 28.0 <= rsi <= 72.0:
+            return None
+        confidence = min(
+            0.68,
+            0.46
+            + min(max(one_candle_pct, 0.0) / 2.0, 0.05)
+            + min(max(recent_momentum_pct + 0.35, 0.0) / 6.0, 0.07)
+            + min(volume_ratio - 0.78, 0.08)
+            + min(expected_upside_pct / 24.0, 0.06),
+        )
+        rsi_text = f"; RSI {rsi:.1f}" if rsi is not None else ""
+        return Signal(
+            Side.BUY,
+            (
+                "micro recovery setup: "
+                f"momentum {recent_momentum_pct:.2f}%; one-candle {one_candle_pct:.2f}%; "
+                f"close position {close_position:.2f}; volume {volume_ratio:.2f}x; "
+                f"expected follow-through {expected_upside_pct:.2f}%{rsi_text}"
+            ),
+            latest_price,
+            confidence,
+        )
 
     def _range_rebound_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> tuple[Signal | None, str]:
         if not self.config.enable_range_rebound:
@@ -308,6 +424,30 @@ def estimate_expected_upside_pct(candles: list[Candle], target_upside_pct: float
     volatility_budget = recent_volatility_pct(candles, lookback=min(20, max(3, len(recent) - 1))) * 1.5
     expected = max(upside_to_high, min(recent_range * 0.5, volatility_budget))
     return min(target_upside_pct, expected)
+
+
+def estimate_trend_follow_through_pct(candles: list[Candle], target_upside_pct: float, lookback: int = 20) -> float:
+    recent = candles[-lookback:]
+    if len(recent) < 4:
+        return 0.0
+    latest = recent[-1].close
+    if latest <= 0:
+        return 0.0
+    ranges = [((candle.high / candle.low) - 1.0) * 100.0 for candle in recent if candle.low > 0]
+    avg_range_pct = mean(ranges) if ranges else 0.0
+    volatility_budget = recent_volatility_pct(candles, lookback=min(lookback, max(3, len(recent) - 1))) * 2.0
+    momentum_5 = ((recent[-1].close / recent[-min(6, len(recent))].close) - 1.0) * 100.0 if recent[-min(6, len(recent))].close > 0 else 0.0
+    recent_high = max(candle.high for candle in recent)
+    high_extension = max(0.0, (recent_high / latest - 1.0) * 100.0)
+    expected = max(avg_range_pct * 3.0, volatility_budget, high_extension, momentum_5 * 0.8)
+    return min(target_upside_pct, max(0.0, expected))
+
+
+def estimate_signal_expected_upside_pct(candles: list[Candle], signal: Signal, config: StrategyConfig) -> float:
+    reason = signal.reason.lower()
+    if "trend breakout setup" in reason or "pullback continuation setup" in reason or "micro recovery setup" in reason:
+        return estimate_trend_follow_through_pct(candles, config.target_upside_pct)
+    return estimate_expected_upside_pct(candles, config.target_upside_pct)
 
 
 def estimate_expected_downside_pct(candles: list[Candle], stop_loss_pct: float, volatility_multiplier: float = 1.1, lookback: int = 20) -> float:

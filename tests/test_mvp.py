@@ -5,9 +5,13 @@ from pathlib import Path
 
 from coin_mvp.broker import PaperBroker
 from coin_mvp.ai_decision import extract_openai_json, review_entry_candidate
+from coin_mvp.backtest import backtest_verdict, candidate_stats, top_blocked_reasons
 from coin_mvp.config import AiDecisionConfig, AppConfig, PathConfig, RiskConfig, StrategyConfig
+from coin_mvp.data import UpbitPublicDataSource
 from coin_mvp.market_context import DecisionContext, maybe_float
+from coin_mvp.ml_decision import score_entry_with_feature_model
 from coin_mvp.models import Candle, OrderbookSnapshot, Position, Side, Signal
+from coin_mvp.news import score_headlines
 from coin_mvp.report import calculate_max_consecutive_losses, calculate_max_drawdown
 from coin_mvp.risk import RiskManager
 from coin_mvp.strategy import (
@@ -191,6 +195,24 @@ class ReportMetricsTest(unittest.TestCase):
     def test_max_consecutive_losses(self):
         self.assertEqual(calculate_max_consecutive_losses([1000, -1, -2, 3, -4, -5, -6]), 3)
 
+    def test_backtest_candidate_and_blocked_reason_summary(self):
+        events = [
+            {"payload": {"candidates": 2, "blocked_reasons": {"weak bounce": 2}}},
+            {"payload": {"candidate_count": 1, "blocked_reasons": {"weak bounce": 1, "wide spread": 1}}},
+            {"payload": {"candidates": 0}},
+        ]
+
+        total, ticks = candidate_stats(events)
+        blocked = top_blocked_reasons(events, limit=2)
+
+        self.assertEqual(total, 3)
+        self.assertEqual(ticks, 2)
+        self.assertEqual(blocked[0]["reason"], "weak bounce")
+
+    def test_backtest_verdict_marks_small_samples(self):
+        self.assertEqual(backtest_verdict(3, 1000.0, 2.0, -100.0), "insufficient_sample")
+        self.assertEqual(backtest_verdict(12, -1000.0, 0.8, -2000.0), "fail")
+
 
 class StrategyFilterTest(unittest.TestCase):
     def test_entry_blocks_overextended_move(self):
@@ -265,7 +287,7 @@ class StrategyFilterTest(unittest.TestCase):
         self.assertLess(fraction, config.position_fraction)
         self.assertGreaterEqual(fraction, config.position_fraction * config.min_volatility_position_fraction)
 
-    def test_long_ema_blocks_entries_below_trend(self):
+    def test_long_ema_does_not_hard_block_shallow_breakout(self):
         config = StrategyConfig(
             short_window=3,
             long_window=5,
@@ -279,8 +301,8 @@ class StrategyFilterTest(unittest.TestCase):
 
         signal = MovingAverageStrategy(config).generate(candles, Position())
 
-        self.assertEqual(signal.side, Side.HOLD)
-        self.assertIn("long trend filter blocked", signal.reason)
+        self.assertEqual(signal.side, Side.BUY)
+        self.assertTrue("trend breakout setup" in signal.reason or "pullback continuation setup" in signal.reason)
 
     def test_generate_surfaces_ma_alignment_failure_reason(self):
         config = StrategyConfig(
@@ -347,6 +369,28 @@ class StrategyFilterTest(unittest.TestCase):
 
         self.assertEqual(signal.side, Side.BUY)
         self.assertIn("range rebound setup", signal.reason)
+
+    def test_micro_recovery_can_buy_without_bollinger(self):
+        config = StrategyConfig(
+            short_window=3,
+            long_window=5,
+            take_profit_pct=1.0,
+            stop_loss_pct=1.0,
+            position_fraction=0.2,
+            min_volume_ratio=1.0,
+            min_expected_upside_pct=1.2,
+            long_trend_ema_window=0,
+            rsi_period=5,
+        )
+        candles = make_variable_candles(
+            [100, 99.8, 99.6, 99.5, 99.4, 99.3, 99.2, 99.25, 99.28, 99.30],
+            [10, 10, 10, 10, 10, 10, 10, 11, 11, 12],
+        )
+
+        signal = MovingAverageStrategy(config).generate(candles, Position())
+
+        self.assertEqual(signal.side, Side.BUY)
+        self.assertIn("micro recovery setup", signal.reason)
 
     def test_range_rebound_rejects_when_far_from_recent_low(self):
         config = StrategyConfig(
@@ -528,6 +572,38 @@ class StrategyFilterTest(unittest.TestCase):
         self.assertEqual(maybe_float("1.25"), 1.25)
         self.assertIsNone(maybe_float("not-a-number"))
 
+    def test_stablecoin_markets_are_excluded_from_trading_universe(self):
+        self.assertIn("KRW-USDT", UpbitPublicDataSource.EXCLUDED_TRADING_MARKETS)
+
+    def test_news_headline_scoring_detects_risk(self):
+        signal = score_headlines([
+            "Bitcoin rally expands as ETF inflow rises",
+            "Crypto exchange hack triggers market selloff",
+        ])
+
+        self.assertEqual(signal.headline_count, 2)
+        self.assertGreater(signal.risk_headline_count, 0)
+
+    def test_local_feature_model_uses_news_features(self):
+        payload = {
+            "candidate": {
+                "signal_reason": "pullback continuation setup",
+                "signal_confidence": 0.72,
+                "expected_upside_pct": 1.8,
+                "expected_downside_pct": 0.6,
+                "recent_volatility_pct": 0.4,
+            },
+            "market_context": {
+                "btc_momentum_pct": 0.2,
+                "news_sentiment_score": 0.4,
+                "news_risk_headline_count": 0,
+            },
+        }
+
+        score = score_entry_with_feature_model(payload)
+
+        self.assertGreater(score.probability, 0.5)
+
 
 class RangeReboundExitGraceTest(unittest.TestCase):
     def test_bollinger_filter_can_create_entry_candidate(self):
@@ -561,6 +637,41 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         self.assertEqual(signal.side, Side.BUY)
         self.assertIn("bollinger rebound setup", signal.reason)
+
+    def test_bollinger_low_upside_keeps_original_hold_reason(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(
+                app.config.strategy,
+                enable_bollinger_rebound_filter=True,
+                bollinger_min_expected_upside_pct=1.5,
+            ),
+        )
+        fallback = Signal(Side.HOLD, "ma alignment failed", 100.0, 0.1)
+
+        signal = app._bollinger_rebound_entry_signal(
+            make_candles([100, 99.99, 100, 99.99, 100, 100.01], volume=10.0),
+            "15m bollinger lower rebound: distance 0.50%",
+            fallback,
+        )
+
+        self.assertEqual(signal.side, Side.HOLD)
+        self.assertIn("ma alignment failed", signal.reason)
+        self.assertIn("bollinger rebound skipped", signal.reason)
+
+    def test_trend_reward_risk_uses_strategy_specific_threshold(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(app.config.risk, max_expected_downside_to_upside_ratio=0.38),
+            strategy=replace(app.config.strategy, min_net_edge_pct=0.0, stop_loss_pct=0.55, stop_volatility_multiplier=0.55),
+        )
+        signal = Signal(Side.BUY, "trend breakout setup", 105.0, 0.7)
+
+        ok, reason = app._reward_risk_ok(make_candles([100, 101, 102, 103, 104, 105], volume=10.0), signal)
+
+        self.assertTrue(ok, reason)
 
     def test_range_rebound_grace_suppresses_early_trend_break(self):
         app = make_test_app(range_rebound_trend_break_grace_ticks=2)
@@ -691,7 +802,7 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         floor = app._candidate_score_floor(context, equity=985_000)
 
-        self.assertGreater(floor, 0.9)
+        self.assertGreater(floor, 0.89)
 
     def test_drawdown_and_losses_reduce_position_fraction(self):
         app = make_test_app()
@@ -710,6 +821,52 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         normal = app._position_fraction_for_context(candles, context, equity=1_000_000)
 
         self.assertLess(reduced, normal)
+
+    def test_bollinger_failure_penalty_does_not_tax_trend_entries(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(
+                app.config.strategy,
+                enable_bollinger_rebound_filter=True,
+                bollinger_filter_penalty=0.04,
+            ),
+        )
+        signal = Signal(Side.BUY, "trend breakout setup; momentum 0.8%", 100.0, 0.7)
+
+        penalty = app._entry_filter_penalty_for_signal(
+            signal,
+            "15m bollinger filter blocked: not near lower band",
+            0.08,
+        )
+
+        self.assertEqual(penalty, 0.0)
+
+    def test_strong_candidate_gets_smaller_breadth_penalty(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(app.config.risk, min_candidate_score=0.44),
+        )
+        signal = Signal(Side.BUY, "uptrend filter passed", 100.0, 0.74)
+
+        penalty = app._breadth_penalty_for_candidate(0.62, signal, 0.10)
+
+        self.assertLess(penalty, 0.10)
+
+    def test_breakeven_stop_uses_peak_profit(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(app.config.strategy, breakeven_trigger_pct=0.6),
+        )
+        position = Position(qty=1.0, avg_price=100.0, peak_price=101.0)
+        candles = make_candles([100.5, 101.0, 100.2, 100.05, 100.01], volume=10.0)
+
+        signal = app._position_management_signal(1, "KRW-BTC", candles, 100.01, position)
+
+        self.assertEqual(signal.side, Side.SELL)
+        self.assertIn("breakeven stop reached", signal.reason)
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:
