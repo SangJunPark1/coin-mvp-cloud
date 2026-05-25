@@ -54,13 +54,53 @@ def run_cloud_ticks(
     if reset:
         storage.reset(config)
         reset_outputs(outputs)
+        if ticks <= 0:
+            refresh_outputs(config, outputs)
+            storage.persist(config)
+            return {
+                "ok": True,
+                "reset": True,
+                "tick": 0,
+                "cash": config.starting_cash,
+                "equity": config.starting_cash,
+                "positions": {},
+                "risk": {
+                    "starting_equity": config.starting_cash,
+                    "entries_today": 0,
+                    "exits_today": 0,
+                    "consecutive_losses": 0,
+                    "halted": False,
+                    "halt_reason": "",
+                },
+                "outputs": [str(output) for output in outputs],
+                "storage": "remote" if storage.enabled else "local",
+            }
     else:
         storage.hydrate(config)
+
+    state = load_state(config.paths.state_file)
+    cooldown = int(config.poll_seconds)
+    if state and cooldown > 0 and not reset:
+        last_run_at = parse_kst_time(str(state.get("last_run_at") or ""))
+        now = datetime.now(KST)
+        if last_run_at is not None and now < last_run_at + timedelta(seconds=cooldown):
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": f"tick cooldown active: {cooldown}s",
+                "next_run_at": (last_run_at + timedelta(seconds=cooldown)).isoformat(timespec="seconds"),
+                "tick": int(state.get("tick", 0)),
+                "cash": state.get("broker", {}).get("cash"),
+                "equity": state.get("equity"),
+                "positions": state.get("broker", {}).get("positions", {}),
+                "risk": state.get("risk", {}),
+                "outputs": [str(output) for output in outputs],
+                "storage": "remote" if storage.enabled else "local",
+            }
 
     data_source = UpbitPublicDataSource()
     markets = data_source.get_top_krw_markets(top_markets, min_trade_price_krw=config.strategy.min_price_krw)
     app = MultiMarketTradingApp(config, data_source, markets, request_delay=request_delay)
-    state = load_state(config.paths.state_file)
     if state:
         apply_state(app, state)
     else:
@@ -100,6 +140,18 @@ def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_kst_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=KST)
+    return parsed.astimezone(KST)
 
 
 def apply_state(app: MultiMarketTradingApp, state: dict[str, Any]) -> None:

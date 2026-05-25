@@ -111,13 +111,13 @@ class MovingAverageStrategy:
             return None
         if latest_price < short_ma * 0.997:
             return None
-        if pullback_depth_pct < 0.12 or reclaim_pct < self.config.min_validated_recovery_pct:
+        if pullback_depth_pct < 0.12 or reclaim_pct < max(1.0, self.config.min_validated_recovery_pct):
             return None
-        if volume_ratio < max(0.85, self.config.min_volume_ratio * 0.9):
+        if volume_ratio < self.config.min_volume_ratio:
             return None
-        if expected_upside_pct < max(0.55, self.config.min_expected_upside_pct * 0.55):
+        if expected_upside_pct < self.config.min_expected_upside_pct:
             return None
-        if rsi is not None and rsi > min(78.0, self.config.max_entry_rsi + 4.0):
+        if rsi is not None and rsi > self.config.max_entry_rsi:
             return None
         confidence = min(
             0.82,
@@ -148,9 +148,16 @@ class MovingAverageStrategy:
         ma_distance_pct = ((latest_price / long_ma) - 1.0) * 100.0 if long_ma else 0.0
         rsi = calculate_rsi(closes, self.config.rsi_period)
         long_trend_ema = calculate_ema(closes, self.config.long_trend_ema_window)
+        candle_range = candles[-1].high - candles[-1].low
+        close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
+        trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
 
         if recent_momentum_pct < self.config.min_recent_momentum_pct:
             return False, f"weak recent momentum: {recent_momentum_pct:.2f}%", 0.2
+        if trend_strength < max(0.10, self.config.min_recent_momentum_pct * 0.8):
+            return False, f"weak trend slope: {trend_strength:.2f}%", 0.2
+        if close_position < 0.55:
+            return False, f"weak breakout close position: {close_position:.2f}", 0.2
         if recent_momentum_pct > self.config.max_recent_momentum_pct or ma_distance_pct > self.config.max_ma_distance_pct:
             return False, f"overextended: momentum {recent_momentum_pct:.2f}%, distance {ma_distance_pct:.2f}%", 0.2
         expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
@@ -161,7 +168,6 @@ class MovingAverageStrategy:
         if volume_ratio < self.config.min_volume_ratio:
             return False, f"thin volume: {volume_ratio:.2f}x", 0.2
 
-        trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
         ema_penalty = 0.0
         ema_text = ""
         if long_trend_ema is not None:

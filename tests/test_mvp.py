@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from coin_mvp.broker import PaperBroker
 from coin_mvp.ai_decision import extract_openai_json, review_entry_candidate
@@ -30,6 +31,8 @@ from coin_mvp.watch_multi import (
     five_minute_trend_penalty,
     orderbook_imbalance_penalty,
     orderbook_spread_penalty,
+    performance_stats,
+    strategy_name_from_reason,
 )
 
 
@@ -99,6 +102,46 @@ class RiskManagerTest(unittest.TestCase):
         )
         self.assertTrue(approved)
         self.assertIn("risk-reducing exit", reason)
+
+    def test_new_entry_pause_blocks_buys_but_allows_sells(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=1.0,
+                daily_loss_limit_pct=1.0,
+                max_entries_per_day=3,
+                max_position_fraction=0.25,
+                max_consecutive_losses=2,
+                new_entries_enabled=False,
+            ),
+            starting_equity=1_000_000,
+        )
+
+        approved, reason = risk.approve(Signal(Side.BUY, "entry", price=100.0), 1_000_000, 0.2)
+        self.assertFalse(approved)
+        self.assertEqual("new entries disabled", reason)
+
+        approved, reason = risk.approve(Signal(Side.SELL, "exit", price=100.0), 1_000_000, 0.2)
+        self.assertTrue(approved)
+        self.assertIn("risk-reducing exit", reason)
+
+    def test_minimum_equity_floor_halts_entries(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=20.0,
+                max_entries_per_day=3,
+                max_position_fraction=0.25,
+                max_consecutive_losses=2,
+                min_equity_krw=900_000,
+            ),
+            starting_equity=1_000_000,
+        )
+
+        approved, reason = risk.approve(Signal(Side.BUY, "entry", price=100.0), 899_000, 0.2, tick=1)
+
+        self.assertFalse(approved)
+        self.assertIn("minimum equity floor reached", reason)
+        self.assertTrue(risk.state.halted)
 
     def test_new_24_hour_period_resets_target_base(self):
         risk = RiskManager(
@@ -867,6 +910,187 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         self.assertEqual(signal.side, Side.SELL)
         self.assertIn("breakeven stop reached", signal.reason)
+
+    def test_recent_negative_expectancy_blocks_new_entries(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(
+                app.config.risk,
+                recent_exit_sample_size=3,
+                min_recent_expectancy_krw=0.0,
+                min_recent_profit_factor=1.05,
+                max_recent_loss_rate=0.70,
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            trade_path = Path(tmp) / "trades.csv"
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        "timestamp,market,side,price,qty,fee,cash_after,position_qty_after,realized_pnl,reason",
+                        "2026-05-25T00:00:00+00:00,KRW-BTC,sell,100,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:01:00+00:00,KRW-ETH,sell,100,1,1,998000,0,-1000,stop",
+                        "2026-05-25T00:02:00+00:00,KRW-XRP,sell,100,1,1,999500,0,500,target",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app.config = replace(app.config, paths=replace(app.config.paths, trade_journal=trade_path))
+
+            ok, reason = app._recent_performance_allows_entries()
+
+        self.assertFalse(ok)
+        self.assertIn("recent performance gate", reason)
+
+    def test_recent_stopout_cluster_blocks_market_entries(self):
+        app = make_test_app()
+        app.market_stopout_ticks = {
+            "KRW-A": [10],
+            "KRW-B": [11],
+            "KRW-C": [12],
+        }
+
+        ok, reason = app._recent_market_stopouts_allow_entries(20)
+
+        self.assertFalse(ok)
+        self.assertIn("market stopout cluster blocked", reason)
+
+    def test_trend_breakout_requires_strong_close_position(self):
+        strategy = MovingAverageStrategy(
+            StrategyConfig(
+                short_window=3,
+                long_window=5,
+                take_profit_pct=1.0,
+                stop_loss_pct=1.0,
+                position_fraction=0.2,
+                min_recent_momentum_pct=0.1,
+                min_volume_ratio=1.0,
+                min_expected_upside_pct=0.1,
+            )
+        )
+        candles = make_variable_candles(
+            [100, 100.2, 100.4, 100.8, 101.0, 101.4, 101.8],
+            [10, 10, 10, 10, 10, 10, 20],
+        )
+        weak_latest = replace(candles[-1], high=104.0, low=100.0, close=101.8)
+        candles = [*candles[:-1], weak_latest]
+
+        signal = strategy.generate(candles, Position())
+
+        self.assertEqual(signal.side, Side.HOLD)
+        self.assertIn("weak breakout close position", signal.reason)
+
+    def test_strategy_performance_gate_blocks_losing_strategy(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(
+                app.config.risk,
+                strategy_exit_sample_size=3,
+                min_strategy_expectancy_krw=0.0,
+                max_strategy_loss_rate=0.8,
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            trade_path = Path(tmp) / "trades.csv"
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        "timestamp,market,side,price,qty,fee,cash_after,position_qty_after,realized_pnl,reason",
+                        "2026-05-25T00:00:00+00:00,KRW-A,buy,100,1,1,900000,1,0,trend breakout setup: momentum 1%",
+                        "2026-05-25T00:01:00+00:00,KRW-A,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:02:00+00:00,KRW-B,buy,100,1,1,900000,1,0,trend breakout setup: momentum 1%",
+                        "2026-05-25T00:03:00+00:00,KRW-B,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:04:00+00:00,KRW-C,buy,100,1,1,900000,1,0,trend breakout setup: momentum 1%",
+                        "2026-05-25T00:05:00+00:00,KRW-C,sell,101,1,1,1000500,0,500,target",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app.config = replace(app.config, paths=replace(app.config.paths, trade_journal=trade_path))
+            app.performance_gate = app.performance_gate.__class__(trade_path)
+
+            ok, reason = app._strategy_performance_allows_entry("trend")
+
+        self.assertFalse(ok)
+        self.assertIn("strategy disabled", reason)
+
+    def test_market_mode_blocks_micro_recovery_in_neutral(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="neutral",
+        )
+
+        ok, reason = app._market_mode_allows_strategy("micro_recovery", context)
+
+        self.assertFalse(ok)
+        self.assertIn("neutral rejects micro recovery", reason)
+
+    def test_performance_position_multiplier_reduces_weak_market(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(app.config.risk, market_exit_sample_size=3, strategy_exit_sample_size=3),
+        )
+        with TemporaryDirectory() as tmp:
+            trade_path = Path(tmp) / "trades.csv"
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        "timestamp,market,side,price,qty,fee,cash_after,position_qty_after,realized_pnl,reason",
+                        "2026-05-25T00:00:00+00:00,KRW-BAD,buy,100,1,1,900000,1,0,trend breakout setup",
+                        "2026-05-25T00:01:00+00:00,KRW-BAD,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:02:00+00:00,KRW-BAD,buy,100,1,1,900000,1,0,trend breakout setup",
+                        "2026-05-25T00:03:00+00:00,KRW-BAD,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:04:00+00:00,KRW-BAD,buy,100,1,1,900000,1,0,trend breakout setup",
+                        "2026-05-25T00:05:00+00:00,KRW-BAD,sell,101,1,1,1000200,0,200,target",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app.performance_gate = app.performance_gate.__class__(trade_path)
+
+            multiplier = app._performance_position_multiplier("KRW-BAD", "trend")
+
+        self.assertLess(multiplier, 1.0)
+
+    def test_high_conviction_candidate_gets_larger_position_fraction(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(app.config.risk, min_candidate_score=0.50),
+        )
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="risk_on",
+        )
+        candles = make_candles([100, 101, 102, 103, 104, 105], volume=10.0)
+        signal = Signal(Side.BUY, "trend breakout setup", 105.0, 0.78)
+
+        normal = app._position_fraction_for_context(candles, context, equity=1_000_000, signal=signal, market="KRW-BTC", score=0.51)
+        high = app._position_fraction_for_context(candles, context, equity=1_000_000, signal=signal, market="KRW-BTC", score=0.72)
+
+        self.assertGreater(high, normal)
+
+    def test_strategy_name_from_reason_and_performance_stats(self):
+        self.assertEqual("pullback", strategy_name_from_reason("pullback continuation setup: trend 0.3%"))
+        expectancy, profit_factor, loss_rate = performance_stats([1000.0, -500.0, 500.0])
+        self.assertGreater(expectancy, 0.0)
+        self.assertEqual(1 / 3, loss_rate)
+        self.assertGreater(profit_factor, 1.0)
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:

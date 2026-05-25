@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import csv
@@ -153,15 +153,15 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; background: var(--bg); color: var(--ink); font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif; font-size: 13px; }}
     main {{ margin: 0; padding: 0 0 36px; }}
-    header {{ height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 14px; background: #171d29; border-bottom: 1px solid #313b4d; position: sticky; top: 0; z-index: 20; }}
+    header {{ min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 14px; background: #171d29; border-bottom: 1px solid #313b4d; position: sticky; top: 0; z-index: 20; }}
     h1 {{ margin: 0; font-size: 15px; color: #f8fbff; font-weight: 750; }}
     h2 {{ font-size: 14px; margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--line); color: #f8fbff; }}
-    .brand {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+    .brand {{ display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }}
     .brand-mark {{ width: 22px; height: 22px; border-radius: 50%; background: #b42318; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 900; }}
-    .nav-tabs {{ display: flex; align-items: center; gap: 28px; margin-left: 20px; height: 52px; }}
+    .nav-tabs {{ display: flex; align-items: center; gap: 28px; margin-left: 20px; height: 52px; overflow-x: auto; scrollbar-width: thin; }}
     .nav-tab {{ height: 52px; display: flex; align-items: center; color: #738198; border-bottom: 2px solid transparent; font-weight: 650; }}
     .nav-tab.active {{ color: #f4f8ff; border-bottom-color: #d8e3f5; }}
-    .top-meta {{ display: flex; align-items: center; gap: 18px; color: #c8d4e6; font-weight: 700; white-space: nowrap; }}
+    .top-meta {{ display: flex; align-items: center; gap: 18px; color: #c8d4e6; font-weight: 700; white-space: nowrap; flex-wrap: wrap; justify-content: flex-end; }}
     .workspace {{ padding: 8px; }}
     .portfolio-hero {{ display: grid; grid-template-columns: minmax(280px, 1.25fr) repeat(3, minmax(170px, .75fr)); gap: 8px; margin-bottom: 8px; }}
     .portfolio-main, .portfolio-sub {{ background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; min-height: 92px; }}
@@ -197,11 +197,12 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     .diagnosis div {{ padding: 13px 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); line-height: 1.55; color: #c8d4e6; }}
     .diagnosis div:nth-child(2n) {{ border-right: 0; }}
     .chart-panel {{ padding: 12px; }}
-    .chart-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }}
+    .chart-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }}
     .chart-title {{ color: #eef5ff; font-weight: 850; }}
-    .chart-tabs {{ display: flex; gap: 14px; color: #738198; font-weight: 750; }}
-    .chart-tabs span:first-child {{ color: var(--blue); }}
-    .equity-chart {{ width: 100%; min-height: 310px; background: #0e131c; border: 1px solid #222d3d; border-radius: 4px; }}
+    .chart-tabs {{ display: inline-flex; gap: 4px; color: #738198; font-weight: 750; background: #0e131c; border: 1px solid #273448; border-radius: 6px; padding: 3px; max-width: 100%; overflow-x: auto; }}
+    .chart-tabs button {{ appearance: none; border: 0; border-radius: 4px; background: transparent; color: #8ea0ba; cursor: pointer; font: inherit; min-height: 30px; padding: 5px 10px; white-space: nowrap; }}
+    .chart-tabs button.active {{ background: #1d2a3d; color: var(--blue); }}
+    .equity-chart {{ display: block; width: 100%; height: auto; min-height: 240px; max-height: 420px; background: #0e131c; border: 1px solid #222d3d; border-radius: 4px; }}
     .progress {{ height: 8px; background: #0b111a; border: 1px solid #243247; border-radius: 999px; overflow: hidden; margin-top: 10px; }}
     .progress-fill {{ height: 100%; background: linear-gradient(90deg, #00a884, #00d4a6); width: {target_bar_width:.2f}%; }}
     .ops-log {{ max-height: 444px; overflow: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; line-height: 1.55; background: #0e131c; }}
@@ -210,15 +211,22 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     .ops-line .event {{ color: var(--green); }}
     .muted {{ color: var(--muted); }}
     @media (max-width: 1000px) {{
-      header {{ height: auto; padding: 12px; display: block; }}
+      header {{ height: auto; padding: 12px; display: block; position: static; }}
+      .top-meta {{ justify-content: flex-start; margin-top: 10px; white-space: normal; }}
       .nav-tabs {{ margin-left: 0; margin-top: 10px; height: 32px; }}
       .nav-tab {{ height: 32px; }}
       .portfolio-hero, .dashboard-grid, .split-grid {{ grid-template-columns: 1fr; }}
       .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      table {{ min-width: 760px; }}
     }}
     @media (max-width: 560px) {{
       .grid, .state-grid, .diagnosis {{ grid-template-columns: 1fr; }}
       .portfolio-amount {{ font-size: 26px; }}
+      .workspace {{ padding: 6px; }}
+      .portfolio-main, .portfolio-sub, .card {{ padding: 12px; }}
+      .chart-panel {{ padding: 10px; }}
+      .equity-chart {{ min-height: 210px; }}
+      table {{ min-width: 680px; }}
     }}
   </style>
 </head>
@@ -249,7 +257,11 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
             <div class="chart-title">누적 수익률</div>
             <div class="muted">마지막 갱신: {html.escape(refreshed_at)}</div>
           </div>
-          <div class="chart-tabs"><span>전체</span><span>7일</span><span>30일</span></div>
+          <div class="chart-tabs" role="group" aria-label="차트 범위">
+            <button type="button" class="active" data-chart-window="all">전체</button>
+            <button type="button" data-chart-window="60">최근 60</button>
+            <button type="button" data-chart-window="240">최근 240</button>
+          </div>
         </div>
         {render_equity_chart(trades, events)}
       </section>
@@ -284,6 +296,7 @@ def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) 
     <section><h2>표본 진단</h2>{render_sample_law(metrics)}</section>
   </div>
 </main>
+{responsive_report_script()}
 </body>
 </html>
 """
@@ -565,8 +578,9 @@ def render_equity_chart(trades: list[TradeRow], events: list[dict[str, Any]]) ->
         grid.append(f'<text x="8" y="{y + 4:.1f}" fill="#7f8da3" font-size="12">{html.escape(short_krw(value))}</text>')
     latest = values[-1]
     latest_x, latest_y = line_points[-1]
+    values_payload = html.escape(json.dumps(values), quote=True)
     return f"""
-    <svg class="equity-chart" viewBox="0 0 {width} {height}" role="img" aria-label="누적 수익률 차트">
+    <svg class="equity-chart" viewBox="0 0 {width} {height}" role="img" aria-label="누적 수익률 차트" data-values="{values_payload}" data-starting-cash="{starting_cash:.8f}">
       <defs>
         <linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="#00d4a6" stop-opacity="0.55"/>
@@ -582,6 +596,101 @@ def render_equity_chart(trades: list[TradeRow], events: list[dict[str, Any]]) ->
       <text x="{width - pad_right}" y="{height - 10}" fill="#7f8da3" font-size="12" text-anchor="end">현재 {html.escape(krw(latest))}</text>
     </svg>
     """
+
+
+def responsive_report_script() -> str:
+    return """
+<script>
+(() => {
+  const svg = document.querySelector(".equity-chart");
+  const buttons = Array.from(document.querySelectorAll("[data-chart-window]"));
+  if (!svg || buttons.length === 0) return;
+
+  const allValues = JSON.parse(svg.dataset.values || "[]").map(Number).filter(Number.isFinite);
+  const startingCash = Number(svg.dataset.startingCash || 1000000);
+  const ns = "http://www.w3.org/2000/svg";
+  const width = 960;
+  const height = 310;
+  const padLeft = 54;
+  const padRight = 16;
+  const padTop = 18;
+  const padBottom = 34;
+
+  const fmtKrw = (value) => {
+    const sign = value < 0 ? "-" : "";
+    const abs = Math.abs(value);
+    if (abs >= 100000000) return `${sign}${(abs / 100000000).toFixed(1)}억`;
+    if (abs >= 10000) return `${sign}${Math.round(abs / 10000)}만`;
+    return `${sign}${Math.round(abs)}`;
+  };
+
+  const node = (name, attrs = {}, text = "") => {
+    const el = document.createElementNS(ns, name);
+    Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, String(value)));
+    if (text) el.textContent = text;
+    return el;
+  };
+
+  const draw = (windowSize) => {
+    let values = allValues.length ? allValues : [startingCash, startingCash];
+    if (windowSize !== "all") {
+      values = values.slice(-Math.max(2, Number(windowSize) || values.length));
+      if (values.length === 1) values = [startingCash, values[0]];
+    }
+    if (values.length < 2) values = [startingCash, startingCash];
+
+    let low = Math.min(...values, startingCash);
+    let high = Math.max(...values, startingCash);
+    if (Math.abs(high - low) < 1) {
+      low -= startingCash * 0.002;
+      high += startingCash * 0.002;
+    }
+    const span = high - low;
+    const plotW = width - padLeft - padRight;
+    const plotH = height - padTop - padBottom;
+    const xy = (index, value) => {
+      const x = padLeft + (index / Math.max(1, values.length - 1)) * plotW;
+      const y = padTop + ((high - value) / span) * plotH;
+      return [x, y];
+    };
+
+    const points = values.map((value, index) => xy(index, value));
+    const line = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+    const area = `${padLeft},${height - padBottom} ${line} ${width - padRight},${height - padBottom}`;
+    svg.replaceChildren();
+
+    const defs = node("defs");
+    const gradient = node("linearGradient", { id: "equityFill", x1: "0", y1: "0", x2: "0", y2: "1" });
+    gradient.append(node("stop", { offset: "0%", "stop-color": "#00d4a6", "stop-opacity": "0.55" }));
+    gradient.append(node("stop", { offset: "100%", "stop-color": "#00d4a6", "stop-opacity": "0.05" }));
+    defs.append(gradient);
+    svg.append(defs);
+    svg.append(node("rect", { x: 0, y: 0, width, height, fill: "#0e131c" }));
+
+    [low, low + span * 0.5, high].forEach((value) => {
+      const [, y] = xy(0, value);
+      svg.append(node("line", { x1: padLeft, y1: y.toFixed(1), x2: width - padRight, y2: y.toFixed(1), stroke: "#334155", "stroke-dasharray": "3 4" }));
+      svg.append(node("text", { x: 8, y: (y + 4).toFixed(1), fill: "#7f8da3", "font-size": 12 }, fmtKrw(value)));
+    });
+
+    const [latestX, latestY] = points[points.length - 1];
+    const latest = values[values.length - 1];
+    svg.append(node("line", { x1: padLeft, y1: padTop, x2: padLeft, y2: height - padBottom, stroke: "#3b4658" }));
+    svg.append(node("polyline", { points: area, fill: "url(#equityFill)", stroke: "none" }));
+    svg.append(node("polyline", { points: line, fill: "none", stroke: "#00d4a6", "stroke-width": 3, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    svg.append(node("circle", { cx: latestX.toFixed(1), cy: latestY.toFixed(1), r: 4, fill: "#00d4a6" }));
+    svg.append(node("text", { x: width - padRight, y: height - 10, fill: "#7f8da3", "font-size": 12, "text-anchor": "end" }, `현재 ${Math.round(latest).toLocaleString("ko-KR")} KRW`));
+  };
+
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      buttons.forEach((item) => item.classList.toggle("active", item === button));
+      draw(button.dataset.chartWindow || "all");
+    });
+  });
+})();
+</script>
+"""
 
 
 def equity_curve_points(trades: list[TradeRow], events: list[dict[str, Any]], starting_cash: float) -> list[tuple[int, float]]:
@@ -1525,5 +1634,248 @@ def to_float(value: Any) -> float | None:
         return None
 
 
+def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
+    trades = sorted(trades, key=lambda trade: parse_sort_time(trade.timestamp))
+    events = sorted(events, key=lambda event: parse_sort_time(str(event.get("timestamp", ""))))
+    metrics = calculate_metrics(trades)
+    portfolio = portfolio_summary(trades, events)
+    open_positions = find_latest_positions(events)
+    latest_context = find_latest_decision_context(events)
+    last_event = events[-1] if events else {}
+    last_payload = last_event.get("payload", {}) if isinstance(last_event, dict) else {}
+    risk = last_payload.get("risk", {}) if isinstance(last_payload, dict) else {}
+    refreshed_at = display_time(str(last_event.get("timestamp", ""))) if last_event else "아직 없음"
+    cash = float(portfolio.get("cash", portfolio["current_equity"]))
+    change = float(portfolio["change_amount"])
+    return_class = "pos" if change >= 0 else "neg"
+    halted = bool(risk.get("halted"))
+    market_mode = str(latest_context.get("market_mode", "unknown")) if latest_context else "unknown"
+    session_label = str(latest_context.get("session_label", "-")) if latest_context else "-"
+    target_amount = float(portfolio["starting_cash"]) * 0.03
+    target_progress = change / target_amount if target_amount else 0.0
+    target_bar_width = max(0.0, min(100.0, target_progress * 100.0))
+    cards = [
+        ("현재 평가금액", krw(float(portfolio["current_equity"]))),
+        ("시작 대비 손익", krw(change)),
+        ("현재 수익률", pct(float(portfolio["return_pct"]) / 100.0)),
+        ("가용 현금", krw(cash)),
+        ("완료 거래", str(metrics["exit_count"])),
+        ("승률", pct(float(metrics["win_rate"]))),
+        ("기대값", krw(float(metrics["expectancy"]))),
+        ("손익비", ratio(float(metrics["payoff_ratio"]))),
+        ("최대 낙폭", krw(float(metrics["max_drawdown"]))),
+        ("오픈 포지션", f"{len(open_positions)}개"),
+        ("오늘 진입", str(risk.get("entries_today", 0))),
+        ("연속 손실", str(risk.get("consecutive_losses", 0))),
+    ]
+    operation_state = "중지" if halted else "운영 중"
+    operation_class = "warn" if halted else "ok"
+    mode_class = "ok" if market_mode == "risk_on" else "warn" if market_mode in {"risk_off", "capital_protect"} else ""
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>코인 오토 트레이딩 시스템</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #0b0f16;
+      --panel: #111722;
+      --panel-2: #151c29;
+      --ink: #edf4ff;
+      --muted: #8ea0ba;
+      --line: #263244;
+      --soft-line: #1c2635;
+      --green: #00d4a6;
+      --red: #ff4d6d;
+      --blue: #6b98ff;
+      --amber: #f7b955;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: var(--bg); color: var(--ink); font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif; font-size: 13px; }}
+    main {{ margin: 0; padding: 0 0 36px; }}
+    header {{ min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 14px; background: #171d29; border-bottom: 1px solid #313b4d; position: sticky; top: 0; z-index: 20; }}
+    h1 {{ margin: 0; font-size: 15px; color: #f8fbff; font-weight: 750; }}
+    h2 {{ font-size: 14px; margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--line); color: #f8fbff; }}
+    .brand {{ display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }}
+    .brand-mark {{ width: 22px; height: 22px; border-radius: 50%; background: #b42318; display: inline-flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 900; }}
+    .nav-tabs {{ display: flex; align-items: center; gap: 20px; margin-left: 16px; height: 52px; overflow-x: auto; scrollbar-width: thin; }}
+    .nav-tab {{ height: 52px; display: flex; align-items: center; color: #738198; border-bottom: 2px solid transparent; font-weight: 650; white-space: nowrap; }}
+    .nav-tab.active {{ color: #f4f8ff; border-bottom-color: #d8e3f5; }}
+    .top-meta {{ display: flex; align-items: center; gap: 16px; color: #c8d4e6; font-weight: 700; white-space: nowrap; flex-wrap: wrap; justify-content: flex-end; }}
+    .workspace {{ padding: 8px; }}
+    .portfolio-hero {{ display: grid; grid-template-columns: minmax(280px, 1.25fr) repeat(3, minmax(170px, .75fr)); gap: 8px; margin-bottom: 8px; }}
+    .portfolio-main, .portfolio-sub, .card, section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }}
+    .portfolio-main, .portfolio-sub {{ padding: 14px 16px; min-height: 92px; }}
+    .portfolio-title, .label, .state-name {{ color: var(--muted); font-size: 12px; font-weight: 650; }}
+    .portfolio-title {{ margin-bottom: 9px; }}
+    .portfolio-amount {{ font-size: 30px; line-height: 1.12; font-weight: 850; overflow-wrap: anywhere; }}
+    .portfolio-value {{ font-size: 22px; line-height: 1.2; font-weight: 850; overflow-wrap: anywhere; }}
+    .portfolio-note {{ margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; }}
+    .grid {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }}
+    .card {{ padding: 11px 12px; min-height: 64px; }}
+    .value {{ font-size: 18px; font-weight: 850; margin-top: 7px; overflow-wrap: anywhere; }}
+    section {{ margin-top: 8px; overflow: hidden; }}
+    .dashboard-grid {{ display: grid; grid-template-columns: minmax(520px, 1.35fr) minmax(340px, .65fr); gap: 8px; align-items: start; }}
+    .split-grid {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }}
+    .table-shell {{ overflow: hidden; }}
+    .table-wrap {{ width: 100%; overflow: auto; -webkit-overflow-scrolling: touch; max-height: 48vh; border-top: 1px solid var(--soft-line); }}
+    table {{ width: 100%; min-width: 760px; border-collapse: separate; border-spacing: 0; table-layout: auto; }}
+    th, td {{ padding: 8px 10px; border-bottom: 1px solid var(--soft-line); text-align: left; vertical-align: top; background: #111722; }}
+    th {{ position: sticky; top: 0; z-index: 3; color: #91a0b8; font-size: 12px; background: #171f2c; white-space: nowrap; font-weight: 750; }}
+    td {{ white-space: nowrap; }}
+    td.text {{ white-space: normal; min-width: 260px; line-height: 1.45; }}
+    td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .buy, .blue {{ color: var(--blue); font-weight: 800; }}
+    .sell, .neg {{ color: var(--red); font-weight: 800; }}
+    .pos, .ok {{ color: var(--green); font-weight: 800; }}
+    .warn {{ color: var(--amber); font-weight: 800; }}
+    .state-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .state-item {{ padding: 13px 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }}
+    .state-item:nth-child(2n) {{ border-right: 0; }}
+    .state-value {{ margin-top: 6px; font-weight: 850; overflow-wrap: anywhere; }}
+    .chart-panel {{ padding: 12px; }}
+    .chart-head {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }}
+    .chart-title {{ color: #eef5ff; font-weight: 850; }}
+    .chart-tabs {{ display: inline-flex; gap: 4px; background: #0e131c; border: 1px solid #273448; border-radius: 6px; padding: 3px; max-width: 100%; overflow-x: auto; }}
+    .chart-tabs button {{ appearance: none; border: 0; border-radius: 4px; background: transparent; color: #8ea0ba; cursor: pointer; font: inherit; min-height: 30px; padding: 5px 10px; white-space: nowrap; }}
+    .chart-tabs button.active {{ background: #1d2a3d; color: var(--blue); }}
+    .equity-chart {{ display: block; width: 100%; height: auto; min-height: 230px; max-height: 420px; background: #0e131c; border: 1px solid #222d3d; border-radius: 4px; }}
+    .progress {{ height: 8px; background: #0b111a; border: 1px solid #243247; border-radius: 999px; overflow: hidden; margin-top: 10px; }}
+    .progress-fill {{ height: 100%; background: linear-gradient(90deg, #00a884, #00d4a6); width: {target_bar_width:.2f}%; }}
+    .ops-log {{ max-height: 444px; overflow: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; line-height: 1.55; background: #0e131c; }}
+    .ops-line {{ padding: 3px 10px; border-bottom: 1px solid #171f2c; color: #c9d5e8; }}
+    .ops-line .time {{ color: #7f8da3; }}
+    .ops-line .event {{ color: var(--green); }}
+    .muted {{ color: var(--muted); }}
+    .diagnosis {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .diagnosis div {{ padding: 13px 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); line-height: 1.55; color: #c8d4e6; }}
+    .diagnosis div:nth-child(2n) {{ border-right: 0; }}
+    @media (max-width: 1000px) {{
+      header {{ height: auto; padding: 12px; display: block; position: static; }}
+      .top-meta {{ justify-content: flex-start; margin-top: 10px; white-space: normal; }}
+      .nav-tabs {{ margin-left: 0; margin-top: 10px; height: 32px; }}
+      .nav-tab {{ height: 32px; }}
+      .portfolio-hero, .dashboard-grid, .split-grid {{ grid-template-columns: 1fr; }}
+      .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    }}
+    @media (max-width: 560px) {{
+      .workspace {{ padding: 6px; }}
+      .grid, .state-grid, .diagnosis {{ grid-template-columns: 1fr; }}
+      .portfolio-amount {{ font-size: 26px; }}
+      .portfolio-main, .portfolio-sub, .card, .chart-panel {{ padding: 12px; }}
+      .equity-chart {{ min-height: 210px; }}
+      table {{ min-width: 680px; }}
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">
+      <span class="brand-mark">↗</span>
+      <h1>코인 오토 트레이딩 시스템</h1>
+      <nav class="nav-tabs">
+        <span class="nav-tab">봇</span>
+        <span class="nav-tab active">수익 리포트</span>
+        <span class="nav-tab">주문 기록</span>
+      </nav>
+    </div>
+    <div class="top-meta">
+      <span>보유 KRW&nbsp; {html.escape(krw(cash))}</span>
+      <span>누적 수익률&nbsp; <span class="{return_class}">{html.escape(pct(float(portfolio["return_pct"]) / 100.0))}</span></span>
+    </div>
+  </header>
+  <div class="workspace">
+    {render_portfolio_hero(portfolio)}
+    <div class="grid">{render_cards(cards)}</div>
+    <div class="dashboard-grid">
+      <section class="chart-panel">
+        <div class="chart-head">
+          <div>
+            <div class="chart-title">누적 수익률</div>
+            <div class="muted">마지막 갱신: {html.escape(refreshed_at)}</div>
+          </div>
+          <div class="chart-tabs" role="group" aria-label="차트 범위">
+            <button type="button" class="active" data-chart-window="all">전체</button>
+            <button type="button" data-chart-window="60">최근 60</button>
+            <button type="button" data-chart-window="240">최근 240</button>
+          </div>
+        </div>
+        {render_equity_chart(trades, events)}
+      </section>
+      <section>
+        <h2>운영 상태</h2>
+        <div class="state-grid">
+          {render_state_item("상태", operation_state, operation_class)}
+          {render_state_item("오픈 포지션", f"{len(open_positions)}개", "")}
+          {render_state_item("시장 모드", market_mode, mode_class)}
+          {render_state_item("시장 세션", session_label, "")}
+          {render_state_item("오늘 진입", str(risk.get("entries_today", 0)), "")}
+          {render_state_item("연속 손실", str(risk.get("consecutive_losses", 0)), "warn" if int(risk.get("consecutive_losses", 0) or 0) else "")}
+          {render_state_item("3% 목표 진행률", pct(target_progress), return_class)}
+          {render_state_item("목표 수익금", krw(target_amount), "")}
+        </div>
+        <div style="padding:0 14px 14px;"><div class="progress"><div class="progress-fill"></div></div></div>
+      </section>
+    </div>
+    <div class="dashboard-grid">
+      <section><h2>오픈 포지션</h2>{render_open_positions(events)}</section>
+      <section><h2>실시간 판단 로그</h2>{render_ops_log_current(events[-120:], trades[-80:])}</section>
+    </div>
+    <div class="split-grid">
+      <section><h2>최근 체결</h2>{render_clean_trade_table(trades[-80:])}</section>
+      <section><h2>수익률 개선 진단</h2>{render_diagnosis(metrics)}</section>
+    </div>
+    <section><h2>필터 차단 분석</h2>{render_filter_block_table(events)}</section>
+    <section><h2>통합 성과 지표</h2>{render_clean_metric_table(metrics)}</section>
+    <section><h2>시장 데이터</h2>{render_market_context_table(events)}</section>
+  </div>
+</main>
+{responsive_report_script()}
+</body>
+</html>
+"""
+
+
+def render_clean_trade_table(trades: list[TradeRow]) -> str:
+    if not trades:
+        return empty_block("아직 거래 기록이 없습니다.")
+    rows = []
+    for trade in reversed(trades):
+        side_class = "buy" if trade.side == "buy" else "sell"
+        pnl_class = "pos" if trade.realized_pnl > 0 else "neg" if trade.realized_pnl < 0 else ""
+        rows.append(
+            (
+                display_time(trade.timestamp),
+                trade.market,
+                f'<span class="{side_class}">{html.escape("매수" if trade.side == "buy" else "매도")}</span>',
+                f"{trade.price:,.4f}",
+                f"{trade.qty:.8f}",
+                krw(trade.fee),
+                f'<span class="{pnl_class}">{html.escape(krw(trade.realized_pnl))}</span>',
+                trade.reason,
+            )
+        )
+    return render_simple_table(["시간", "마켓", "구분", "가격", "수량", "수수료", "손익", "이유"], rows, raw_cols={2, 6}, text_cols={7}, num_cols={3, 4, 5, 6})
+
+
+def render_clean_metric_table(metrics: dict[str, float | int]) -> str:
+    rows = [
+        ("완료 거래 수", metrics["exit_count"], "승률과 기대값 계산에 사용한 청산 완료 거래 수입니다."),
+        ("승리 / 패배", f"{metrics['win_count']} / {metrics['loss_count']}", "실현 손익이 양수/음수인 청산 거래 수입니다."),
+        ("평균 이익", krw(float(metrics["avg_win"])), "이익 거래의 평균 실현 손익입니다."),
+        ("평균 손실", krw(float(metrics["avg_loss"])), "손실 거래의 평균 실현 손익입니다."),
+        ("손익비", ratio(float(metrics["payoff_ratio"])), "평균 이익 / 평균 손실 절댓값입니다."),
+        ("기대값", krw(float(metrics["expectancy"])), "거래 1회당 평균적으로 기대하는 손익입니다."),
+        ("수익 팩터", ratio(float(metrics["profit_factor"])), "총이익 / 총손실 절댓값입니다. 1보다 커야 합니다."),
+        ("최대 낙폭", krw(float(metrics["max_drawdown"])), "실현 손익 누적 기준 최고점 대비 최악 하락폭입니다."),
+        ("최대 연속 손실", str(metrics["max_consecutive_losses"]), "손실 청산이 연속으로 발생한 최댓값입니다."),
+    ]
+    return render_simple_table(["지표", "값", "해석"], rows, text_cols={2}, num_cols={1})
+
+
 if __name__ == "__main__":
     main()
+

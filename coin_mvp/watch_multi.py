@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from dataclasses import asdict
 from datetime import timedelta, timezone
@@ -33,6 +34,58 @@ from .watch import refresh_report
 KST = timezone(timedelta(hours=9))
 
 
+class StrategyPerformanceGate:
+    def __init__(self, trade_path: Path) -> None:
+        self.trade_path = trade_path
+        self._signature: tuple[int, int] | None = None
+        self._round_trips: list[dict[str, object]] = []
+
+    def round_trips(self) -> list[dict[str, object]]:
+        signature = self._file_signature()
+        if signature == self._signature:
+            return self._round_trips
+        self._signature = signature
+        self._round_trips = self._load_round_trips()
+        return self._round_trips
+
+    def _file_signature(self) -> tuple[int, int]:
+        if not self.trade_path.exists():
+            return (0, 0)
+        stat = self.trade_path.stat()
+        return (int(stat.st_mtime), int(stat.st_size))
+
+    def _load_round_trips(self) -> list[dict[str, object]]:
+        if not self.trade_path.exists():
+            return []
+        open_entries: dict[str, dict[str, str]] = {}
+        pairs: list[dict[str, object]] = []
+        with self.trade_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                market = str(row.get("market") or "")
+                side = str(row.get("side") or "")
+                if not market:
+                    continue
+                if side == "buy":
+                    open_entries[market] = row
+                elif side == "sell":
+                    entry = open_entries.pop(market, None)
+                    if entry is None:
+                        continue
+                    try:
+                        pnl = float(row.get("realized_pnl") or 0.0)
+                    except ValueError:
+                        continue
+                    pairs.append(
+                        {
+                            "market": market,
+                            "strategy": strategy_name_from_reason(str(entry.get("reason") or "")),
+                            "pnl": pnl,
+                        }
+                    )
+        return pairs
+
+
 class MultiMarketTradingApp:
     def __init__(self, config: AppConfig, data_source: UpbitPublicDataSource, markets: list[str], request_delay: float) -> None:
         self.config = config
@@ -53,11 +106,36 @@ class MultiMarketTradingApp:
         self.market_reentry_until_tick: dict[str, int] = {}
         self.market_stopout_ticks: dict[str, list[int]] = {}
         self.last_decision_context: dict[str, object] = {}
+        self.performance_gate = StrategyPerformanceGate(config.paths.trade_journal)
 
     def run_tick(self, tick: int) -> None:
         self.risk.refresh_halt(self.broker.equity(self.last_prices), tick=tick)
         for market in list(self.broker.open_markets()):
             self._manage_open_position(tick, market)
+        if not self.config.risk.new_entries_enabled:
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": "new entries disabled",
+                    "risk": self.risk.state,
+                },
+            )
+            return
+        if self.risk.state.halted:
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": self.risk.state.halt_reason,
+                    "risk": self.risk.state,
+                },
+            )
+            return
         if len(self.broker.open_markets()) >= self.config.risk.max_open_positions:
             return
         self._scan_and_enter(tick)
@@ -101,6 +179,34 @@ class MultiMarketTradingApp:
         self.last_decision_context = context.to_dict()
         if self.request_delay > 0:
             time.sleep(self.request_delay)
+        performance_ok, performance_reason = self._recent_performance_allows_entries()
+        if not performance_ok:
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": performance_reason,
+                    "decision_context": context.to_dict(),
+                    "risk": self.risk.state,
+                },
+            )
+            return
+        market_health_ok, market_health_reason = self._recent_market_stopouts_allow_entries(tick)
+        if not market_health_ok:
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": market_health_reason,
+                    "decision_context": context.to_dict(),
+                    "risk": self.risk.state,
+                },
+            )
+            return
         if not context.allows_entries:
             self.journal.event(
                 "market_scan",
@@ -157,6 +263,12 @@ class MultiMarketTradingApp:
             if signal.side != Side.BUY:
                 signal = self._bollinger_rebound_entry_signal(candles, filter_reason, signal)
             if signal.side == Side.BUY:
+                strategy_gate_ok, strategy_gate_reason = self._candidate_adaptive_gate(market, signal, context)
+                if not strategy_gate_ok:
+                    blocked_reasons[strategy_gate_reason] = blocked_reasons.get(strategy_gate_reason, 0) + 1
+                    if len(blocked_samples) < 20:
+                        blocked_samples.append({"market": market, "reason": strategy_gate_reason, "price": candles[-1].close})
+                    continue
                 recovery_ok, recovery_reason = self._validated_recovery_ok(candles, signal)
                 if not recovery_ok:
                     blocked_reasons[recovery_reason] = blocked_reasons.get(recovery_reason, 0) + 1
@@ -244,7 +356,7 @@ class MultiMarketTradingApp:
             latest_price = candles[-1].close
             self.last_prices[market] = latest_price
             equity = self.broker.equity(self.last_prices)
-            position_fraction = self._position_fraction_for_context(candles, context, equity)
+            position_fraction = self._position_fraction_for_context(candles, context, equity, signal, market, score)
             decision_review = review_entry_candidate(signal, candles, context, self.config.strategy, self.config.ai_decision)
             if decision_review.action != "buy":
                 self._log_tick(
@@ -434,9 +546,14 @@ class MultiMarketTradingApp:
         recovered_price = latest.close >= short_ma or latest.close >= previous.close
         strong_recovery = recovery_momentum >= self.config.strategy.min_validated_recovery_pct or one_candle_recovery >= self.config.strategy.min_validated_recovery_pct
         if "trend breakout setup" in signal.reason:
-            if volume_ratio < max(0.8, self.config.strategy.min_volume_ratio * 0.8):
+            if recovery_momentum < self.config.strategy.min_validated_recovery_pct and one_candle_recovery < 0.05:
+                return False, (
+                    "validated recovery blocked: "
+                    f"trend recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
+                )
+            if volume_ratio < self.config.strategy.min_volume_ratio:
                 return False, f"validated recovery blocked: trend volume {volume_ratio:.2f}x"
-            if close_position < 0.40:
+            if close_position < 0.55:
                 return False, f"validated recovery blocked: weak trend close position {close_position:.2f}"
             return True, (
                 f"validated trend ok: recovery {recovery_momentum:.2f}%, "
@@ -477,7 +594,15 @@ class MultiMarketTradingApp:
         slippage_pct = self.config.slippage_bps * 2.0 / 100.0
         return fee_pct + slippage_pct
 
-    def _position_fraction_for_context(self, candles: list[Candle], context, equity: float | None = None) -> float:
+    def _position_fraction_for_context(
+        self,
+        candles: list[Candle],
+        context,
+        equity: float | None = None,
+        signal: Signal | None = None,
+        market: str | None = None,
+        score: float | None = None,
+    ) -> float:
         base = volatility_adjusted_position_fraction(candles, self.config.strategy)
         multiplier = float(getattr(context, "position_fraction_multiplier", 1.0) or 1.0)
         multiplier *= self._drawdown_exposure_multiplier(equity)
@@ -485,7 +610,24 @@ class MultiMarketTradingApp:
             multiplier *= 0.7
         elif self.risk.state.consecutive_losses == 1:
             multiplier *= 0.85
+        if signal is not None and self.config.risk.adaptive_position_sizing:
+            multiplier *= self._performance_position_multiplier(market or "", self._entry_strategy_name(signal))
+            multiplier *= self._conviction_position_multiplier(signal, score)
         return max(0.0, base * multiplier)
+
+    def _conviction_position_multiplier(self, signal: Signal, score: float | None) -> float:
+        if score is None:
+            return 1.0
+        edge = score - self.config.risk.min_candidate_score
+        if signal.confidence >= 0.76 and edge >= 0.18:
+            return 1.35
+        if signal.confidence >= 0.70 and edge >= 0.10:
+            return 1.22
+        if signal.confidence >= 0.64 and edge >= 0.04:
+            return 1.08
+        if edge < 0.02:
+            return 0.88
+        return 1.0
 
     def _max_downside_to_upside_for_signal(self, signal: Signal) -> float:
         reason = signal.reason.lower()
@@ -517,6 +659,8 @@ class MultiMarketTradingApp:
 
     def _max_new_entries_for_context(self, context) -> int:
         configured = max(1, self.config.risk.max_new_entries_per_tick)
+        if self.risk.state.entries_today >= 3:
+            return 1
         mode = str(getattr(context, "market_mode", "neutral"))
         if mode == "risk_on":
             return configured
@@ -540,11 +684,151 @@ class MultiMarketTradingApp:
             base += 0.12
         elif self.risk.state.consecutive_losses == 1:
             base += 0.05
-        if self.risk.state.entries_today >= 24:
-            base += 0.12
-        elif self.risk.state.entries_today >= 12:
+        if self.risk.state.entries_today >= 12:
+            base += 0.14
+        elif self.risk.state.entries_today >= 6:
+            base += 0.10
+        elif self.risk.state.entries_today >= 3:
             base += 0.06
         return base
+
+    def _candidate_adaptive_gate(self, market: str, signal: Signal, context) -> tuple[bool, str]:
+        strategy_name = self._entry_strategy_name(signal)
+        mode_ok, mode_reason = self._market_mode_allows_strategy(strategy_name, context)
+        if not mode_ok:
+            return False, mode_reason
+        strategy_ok, strategy_reason = self._strategy_performance_allows_entry(strategy_name)
+        if not strategy_ok:
+            return False, strategy_reason
+        market_ok, market_reason = self._market_performance_allows_entry(market)
+        if not market_ok:
+            return False, market_reason
+        return True, "adaptive gate ok"
+
+    def _market_mode_allows_strategy(self, strategy_name: str, context) -> tuple[bool, str]:
+        mode = str(getattr(context, "market_mode", "neutral"))
+        if mode == "capital_protect":
+            return False, "market mode blocked: capital protect"
+        if mode == "risk_off" and strategy_name in {"trend", "micro_recovery"}:
+            return False, f"market mode blocked: {mode} rejects {strategy_name}"
+        if mode == "neutral" and strategy_name == "micro_recovery":
+            return False, "market mode blocked: neutral rejects micro recovery"
+        return True, "market mode ok"
+
+    def _strategy_performance_allows_entry(self, strategy_name: str) -> tuple[bool, str]:
+        sample_size = self.config.risk.strategy_exit_sample_size
+        if sample_size <= 0:
+            return True, "strategy performance gate disabled"
+        pnls = [
+            float(item["pnl"])
+            for item in self.performance_gate.round_trips()
+            if item.get("strategy") == strategy_name
+        ][-sample_size:]
+        if len(pnls) < sample_size:
+            return True, f"strategy performance warming up: {strategy_name} {len(pnls)}/{sample_size}"
+        expectancy, profit_factor, loss_rate = performance_stats(pnls)
+        if expectancy < self.config.risk.min_strategy_expectancy_krw:
+            return False, f"strategy disabled: {strategy_name} expectancy {expectancy:.0f} KRW"
+        if loss_rate > self.config.risk.max_strategy_loss_rate:
+            return False, f"strategy disabled: {strategy_name} loss rate {loss_rate:.0%}"
+        return True, f"strategy performance ok: {strategy_name} pf {profit_factor:.2f}"
+
+    def _market_performance_allows_entry(self, market: str) -> tuple[bool, str]:
+        sample_size = self.config.risk.market_exit_sample_size
+        if sample_size <= 0:
+            return True, "market performance gate disabled"
+        pnls = [
+            float(item["pnl"])
+            for item in self.performance_gate.round_trips()
+            if item.get("market") == market
+        ][-sample_size:]
+        if len(pnls) < sample_size:
+            return True, f"market performance warming up: {market} {len(pnls)}/{sample_size}"
+        expectancy, _profit_factor, loss_rate = performance_stats(pnls)
+        if expectancy < self.config.risk.min_market_expectancy_krw:
+            return False, f"market disabled: {market} expectancy {expectancy:.0f} KRW"
+        if loss_rate > self.config.risk.max_market_loss_rate:
+            return False, f"market disabled: {market} loss rate {loss_rate:.0%}"
+        return True, f"market performance ok: {market}"
+
+    def _performance_position_multiplier(self, market: str, strategy_name: str) -> float:
+        trips = self.performance_gate.round_trips()
+        strategy_sample = [float(item["pnl"]) for item in trips if item.get("strategy") == strategy_name][-self.config.risk.strategy_exit_sample_size :]
+        market_sample = [float(item["pnl"]) for item in trips if item.get("market") == market][-self.config.risk.market_exit_sample_size :]
+        multiplier = 1.0
+        for sample in (strategy_sample, market_sample):
+            if len(sample) < 2:
+                continue
+            expectancy, profit_factor, loss_rate = performance_stats(sample)
+            if expectancy > 0 and profit_factor >= 1.35 and loss_rate <= 0.5:
+                multiplier *= 1.08
+            elif expectancy < 0 or profit_factor < 1.0 or loss_rate >= 0.67:
+                multiplier *= 0.72
+            elif profit_factor < 1.15:
+                multiplier *= 0.88
+        return max(0.45, min(1.18, multiplier))
+
+    def _recent_performance_allows_entries(self) -> tuple[bool, str]:
+        sample_size = self.config.risk.recent_exit_sample_size
+        if sample_size <= 0:
+            return True, "recent performance gate disabled"
+        pnls = self._recent_exit_pnls(sample_size)
+        if len(pnls) < sample_size:
+            return True, f"recent performance sample warming up: {len(pnls)}/{sample_size}"
+        wins = [value for value in pnls if value > 0]
+        losses = [value for value in pnls if value < 0]
+        expectancy = sum(pnls) / len(pnls)
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+        loss_rate = len(losses) / len(pnls)
+        if expectancy < self.config.risk.min_recent_expectancy_krw:
+            return False, (
+                "recent performance gate: "
+                f"expectancy {expectancy:.0f} KRW < {self.config.risk.min_recent_expectancy_krw:.0f} KRW"
+            )
+        if profit_factor < self.config.risk.min_recent_profit_factor:
+            return False, (
+                "recent performance gate: "
+                f"profit factor {profit_factor:.2f} < {self.config.risk.min_recent_profit_factor:.2f}"
+            )
+        if loss_rate > self.config.risk.max_recent_loss_rate:
+            return False, (
+                "recent performance gate: "
+                f"loss rate {loss_rate:.0%} > {self.config.risk.max_recent_loss_rate:.0%}"
+            )
+        return True, (
+            "recent performance ok: "
+            f"expectancy {expectancy:.0f} KRW, profit factor {profit_factor:.2f}, loss rate {loss_rate:.0%}"
+        )
+
+    def _recent_exit_pnls(self, sample_size: int) -> list[float]:
+        path = self.config.paths.trade_journal
+        if not path.exists():
+            return []
+        values: list[float] = []
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if row.get("side") != "sell":
+                    continue
+                try:
+                    values.append(float(row.get("realized_pnl") or 0.0))
+                except ValueError:
+                    continue
+        return values[-sample_size:]
+
+    def _recent_market_stopouts_allow_entries(self, tick: int) -> tuple[bool, str]:
+        lookback = max(1, min(self.config.strategy.stopout_lookback_ticks, 96))
+        recent_markets = []
+        for market in list(self.market_stopout_ticks):
+            self._prune_stopouts(market, tick)
+            ticks = self.market_stopout_ticks.get(market, [])
+            if any(tick - value <= lookback for value in ticks):
+                recent_markets.append(market)
+        if len(recent_markets) >= 3:
+            return False, f"market stopout cluster blocked: {len(recent_markets)} markets in {lookback} ticks"
+        return True, "market stopout cluster ok"
 
     def _period_drawdown_pct(self, equity: float | None) -> float:
         if equity is None or self.risk.state.starting_equity <= 0:
@@ -972,6 +1256,32 @@ def orderbook_spread_penalty(spread_bps: float, max_spread_bps: float) -> float:
 def orderbook_imbalance_penalty(imbalance_ratio: float, min_imbalance_ratio: float) -> float:
     shortfall = max(0.0, min_imbalance_ratio - imbalance_ratio)
     return min(0.2, 0.05 + shortfall / max(0.1, min_imbalance_ratio) * 0.2)
+
+
+def strategy_name_from_reason(reason: str) -> str:
+    text = reason.lower()
+    if "bollinger rebound setup" in text:
+        return "bollinger_rebound"
+    if "range rebound setup" in text:
+        return "range_rebound"
+    if "pullback continuation setup" in text:
+        return "pullback"
+    if "micro recovery setup" in text:
+        return "micro_recovery"
+    return "trend"
+
+
+def performance_stats(pnls: list[float]) -> tuple[float, float, float]:
+    if not pnls:
+        return 0.0, 0.0, 0.0
+    wins = [value for value in pnls if value > 0]
+    losses = [value for value in pnls if value < 0]
+    expectancy = sum(pnls) / len(pnls)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999.0
+    loss_rate = len(losses) / len(pnls)
+    return expectancy, profit_factor, loss_rate
 
 
 if __name__ == "__main__":

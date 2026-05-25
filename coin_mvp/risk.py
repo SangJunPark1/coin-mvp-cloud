@@ -61,6 +61,11 @@ class RiskManager:
             return False, self.state.halt_reason
         if signal.side == Side.HOLD:
             return False, "hold signal"
+        if not self.config.new_entries_enabled:
+            return False, "new entries disabled"
+        if self.config.min_equity_krw > 0 and current_equity < self.config.min_equity_krw:
+            self._halt(f"minimum equity floor reached: {current_equity:.0f} KRW", tick, 0)
+            return False, self.state.halt_reason
         if self.state.entries_today >= self.config.max_entries_per_day:
             return False, "max daily entries reached"
         if self.state.consecutive_losses >= self.config.max_consecutive_losses:
@@ -86,6 +91,8 @@ class RiskManager:
             self._halt(f"daily profit target reached: {pnl_pct:.2f}%", tick, 0)
         elif pnl_pct <= -self.config.daily_loss_limit_pct:
             self._halt(f"daily loss limit reached: {pnl_pct:.2f}%", tick, self.config.halt_cooldown_ticks)
+        elif self.config.min_equity_krw > 0 and current_equity < self.config.min_equity_krw:
+            self._halt(f"minimum equity floor reached: {current_equity:.0f} KRW", tick, 0)
 
     def _halt(self, reason: str, tick: int | None, cooldown_ticks: int) -> None:
         if self.state.halted and self.state.halt_reason == reason:

@@ -81,6 +81,8 @@ class RiskConfig:
     max_entries_per_day: int
     max_position_fraction: float
     max_consecutive_losses: int
+    new_entries_enabled: bool = True
+    min_equity_krw: float = 0.0
     halt_cooldown_ticks: int = 6
     consecutive_loss_cooldown_ticks: int = 12
     max_expected_downside_to_upside_ratio: float = 1.0
@@ -89,6 +91,17 @@ class RiskConfig:
     max_new_entries_per_tick: int = 1
     min_trade_cash_krw: float = 0.0
     min_candidate_score: float = 0.0
+    recent_exit_sample_size: int = 20
+    min_recent_expectancy_krw: float = 0.0
+    min_recent_profit_factor: float = 1.05
+    max_recent_loss_rate: float = 0.58
+    strategy_exit_sample_size: int = 6
+    market_exit_sample_size: int = 4
+    min_strategy_expectancy_krw: float = 0.0
+    min_market_expectancy_krw: float = 0.0
+    max_strategy_loss_rate: float = 0.67
+    max_market_loss_rate: float = 0.75
+    adaptive_position_sizing: bool = True
 
 
 @dataclass(frozen=True)
@@ -212,6 +225,8 @@ def load_config(path: str | Path) -> AppConfig:
             max_entries_per_day=int(risk.get("max_entries_per_day", risk.get("max_trades_per_day", 3))),
             max_position_fraction=float(risk["max_position_fraction"]),
             max_consecutive_losses=int(risk["max_consecutive_losses"]),
+            new_entries_enabled=bool(risk.get("new_entries_enabled", True)),
+            min_equity_krw=float(risk.get("min_equity_krw", 0.0)),
             halt_cooldown_ticks=int(risk.get("halt_cooldown_ticks", 6)),
             consecutive_loss_cooldown_ticks=int(risk.get("consecutive_loss_cooldown_ticks", risk.get("halt_cooldown_ticks", 6))),
             max_expected_downside_to_upside_ratio=float(risk.get("max_expected_downside_to_upside_ratio", 1.0)),
@@ -220,6 +235,17 @@ def load_config(path: str | Path) -> AppConfig:
             max_new_entries_per_tick=int(risk.get("max_new_entries_per_tick", 1)),
             min_trade_cash_krw=float(risk.get("min_trade_cash_krw", 0.0)),
             min_candidate_score=float(risk.get("min_candidate_score", 0.0)),
+            recent_exit_sample_size=int(risk.get("recent_exit_sample_size", 20)),
+            min_recent_expectancy_krw=float(risk.get("min_recent_expectancy_krw", 0.0)),
+            min_recent_profit_factor=float(risk.get("min_recent_profit_factor", 1.05)),
+            max_recent_loss_rate=float(risk.get("max_recent_loss_rate", 0.58)),
+            strategy_exit_sample_size=int(risk.get("strategy_exit_sample_size", 6)),
+            market_exit_sample_size=int(risk.get("market_exit_sample_size", 4)),
+            min_strategy_expectancy_krw=float(risk.get("min_strategy_expectancy_krw", 0.0)),
+            min_market_expectancy_krw=float(risk.get("min_market_expectancy_krw", 0.0)),
+            max_strategy_loss_rate=float(risk.get("max_strategy_loss_rate", 0.67)),
+            max_market_loss_rate=float(risk.get("max_market_loss_rate", 0.75)),
+            adaptive_position_sizing=bool(risk.get("adaptive_position_sizing", True)),
         ),
         ai_decision=AiDecisionConfig(
             enabled=bool(ai_decision.get("enabled", True)),
@@ -373,12 +399,28 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_total_position_fraction must be between 0 and 1.")
     if config.risk.max_entries_per_day < 1:
         raise ValueError("max_entries_per_day must be at least 1.")
+    if config.risk.min_equity_krw < 0:
+        raise ValueError("min_equity_krw must not be negative.")
     if config.risk.max_new_entries_per_tick < 1:
         raise ValueError("max_new_entries_per_tick must be at least 1.")
     if config.risk.min_trade_cash_krw < 0:
         raise ValueError("min_trade_cash_krw must not be negative.")
     if config.risk.min_candidate_score < 0:
         raise ValueError("min_candidate_score must not be negative.")
+    if config.risk.recent_exit_sample_size < 0:
+        raise ValueError("recent_exit_sample_size must not be negative.")
+    if config.risk.min_recent_profit_factor < 0:
+        raise ValueError("min_recent_profit_factor must not be negative.")
+    if not 0 <= config.risk.max_recent_loss_rate <= 1:
+        raise ValueError("max_recent_loss_rate must be between 0 and 1.")
+    if config.risk.strategy_exit_sample_size < 0:
+        raise ValueError("strategy_exit_sample_size must not be negative.")
+    if config.risk.market_exit_sample_size < 0:
+        raise ValueError("market_exit_sample_size must not be negative.")
+    if not 0 <= config.risk.max_strategy_loss_rate <= 1:
+        raise ValueError("max_strategy_loss_rate must be between 0 and 1.")
+    if not 0 <= config.risk.max_market_loss_rate <= 1:
+        raise ValueError("max_market_loss_rate must be between 0 and 1.")
     if config.risk.halt_cooldown_ticks < 0:
         raise ValueError("halt_cooldown_ticks must not be negative.")
     if config.risk.consecutive_loss_cooldown_ticks < 0:

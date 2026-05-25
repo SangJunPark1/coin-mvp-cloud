@@ -11,9 +11,9 @@ from coin_mvp.cloud_tick import run_cloud_ticks
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
         secret = os.environ.get("CRON_SECRET", "")
         if secret:
-            query = parse_qs(urlparse(self.path).query)
             provided = self.headers.get("x-cron-secret") or ""
             bearer = self.headers.get("authorization") or ""
             query_secret = query.get("secret", [""])[0]
@@ -22,13 +22,15 @@ class handler(BaseHTTPRequestHandler):
                 return
 
         try:
+            reset = query.get("reset", [""])[0].lower() in {"1", "true", "yes"}
+            reset_only = query.get("reset_only", [""])[0].lower() in {"1", "true", "yes"}
             result = run_cloud_ticks(
                 config_path=os.environ.get("COIN_MVP_CONFIG", "config.cloud.json"),
-                top_markets=int(os.environ.get("TOP_MARKETS", "30")),
-                request_delay=float(os.environ.get("REQUEST_DELAY", "0.35")),
-                ticks=1,
+                top_markets=int(os.environ.get("TOP_MARKETS", "8")),
+                request_delay=float(os.environ.get("REQUEST_DELAY", "0.10")),
+                ticks=0 if reset_only else 1,
                 outputs=[Path(os.environ.get("REPORT_OUTPUT", "/tmp/coin_mvp/report.html"))],
-                reset=False,
+                reset=reset,
             )
             result["report_url"] = "/api/report"
             self._send_json(result)
