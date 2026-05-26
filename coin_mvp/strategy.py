@@ -46,6 +46,9 @@ class MovingAverageStrategy:
         micro_signal = self._micro_recovery_signal(candles, short_ma, long_ma)
         if micro_signal is not None:
             return micro_signal
+        chart_signal = self._chart_ai_signal(candles, short_ma, long_ma)
+        if chart_signal is not None:
+            return chart_signal
         range_signal, range_reason = self._range_rebound_signal(candles, short_ma, long_ma)
         if range_signal is not None:
             return range_signal
@@ -225,6 +228,86 @@ class MovingAverageStrategy:
                 f"momentum {recent_momentum_pct:.2f}%; one-candle {one_candle_pct:.2f}%; "
                 f"close position {close_position:.2f}; volume {volume_ratio:.2f}x; "
                 f"expected follow-through {expected_upside_pct:.2f}%{rsi_text}"
+            ),
+            latest_price,
+            confidence,
+        )
+
+    def _chart_ai_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        features = chart_feature_snapshot(candles, self.config.rsi_period)
+        if not features:
+            return None
+        latest_price = candles[-1].close
+        rsi = features["rsi"]
+        volume_ratio = features["volume_ratio"]
+        close_position = features["close_position"]
+        momentum_3 = features["momentum_3_pct"]
+        momentum_8 = features["momentum_8_pct"]
+        ema9_gap = features["ema9_gap_pct"]
+        ema21_gap = features["ema21_gap_pct"]
+        recent_high_gap = features["recent_high_gap_pct"]
+        distance_from_low = features["distance_from_low_pct"]
+        range_expansion = features["range_expansion_ratio"]
+        expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
+        if expected_upside_pct < max(0.7, self.config.min_expected_upside_pct * 0.62):
+            return None
+        if rsi > min(78.0, self.config.max_entry_rsi + 8.0) or rsi < 30.0:
+            return None
+        if close_position < 0.46:
+            return None
+
+        setup = ""
+        base_confidence = 0.50
+        if (
+            ema9_gap >= -0.18
+            and ema21_gap >= -0.35
+            and momentum_3 >= 0.08
+            and volume_ratio >= max(0.95, self.config.min_volume_ratio * 0.70)
+            and close_position >= 0.56
+        ):
+            setup = "momentum ignition"
+            base_confidence = 0.58
+        elif (
+            distance_from_low <= 2.8
+            and momentum_3 >= -0.05
+            and momentum_8 >= -0.45
+            and volume_ratio >= 0.82
+            and close_position >= 0.55
+            and 36.0 <= rsi <= 62.0
+            and latest_price >= short_ma * 0.992
+        ):
+            setup = "pullback reclaim"
+            base_confidence = 0.55
+        elif (
+            range_expansion >= 1.15
+            and volume_ratio >= max(0.95, self.config.min_volume_ratio * 0.68)
+            and momentum_3 >= 0.03
+            and recent_high_gap <= 1.6
+            and close_position >= 0.58
+        ):
+            setup = "volatility expansion"
+            base_confidence = 0.56
+        if not setup:
+            return None
+
+        ma_alignment_bonus = 0.0
+        if short_ma > long_ma:
+            ma_alignment_bonus = min(((short_ma / long_ma) - 1.0) * 3.0, 0.07) if long_ma > 0 else 0.0
+        confidence = min(
+            0.84,
+            base_confidence
+            + min(max(momentum_3, 0.0) / 4.0, 0.07)
+            + min(max(volume_ratio - 0.8, 0.0) / 5.0, 0.08)
+            + min(expected_upside_pct / 24.0, 0.08)
+            + min(max(close_position - 0.45, 0.0) / 4.0, 0.05)
+            + ma_alignment_bonus,
+        )
+        return Signal(
+            Side.BUY,
+            (
+                f"chart ai setup: {setup}; momentum3 {momentum_3:.2f}%; momentum8 {momentum_8:.2f}%; "
+                f"volume {volume_ratio:.2f}x; RSI {rsi:.1f}; close position {close_position:.2f}; "
+                f"high gap {recent_high_gap:.2f}%; expected follow-through {expected_upside_pct:.2f}%"
             ),
             latest_price,
             confidence,
@@ -416,6 +499,41 @@ def recent_volatility_pct(candles: list[Candle], lookback: int = 20) -> float:
     return math.sqrt(variance) * math.sqrt(len(returns)) * 100.0
 
 
+def chart_feature_snapshot(candles: list[Candle], rsi_period: int = 14) -> dict[str, float]:
+    if len(candles) < max(12, rsi_period + 1):
+        return {}
+    closes = [c.close for c in candles]
+    latest = closes[-1]
+    if latest <= 0:
+        return {}
+    recent = candles[-20:]
+    recent_high = max(candle.high for candle in recent)
+    recent_low = min(candle.low for candle in recent)
+    current_range = max(0.0, ((candles[-1].high / candles[-1].low) - 1.0) * 100.0) if candles[-1].low > 0 else 0.0
+    prior_ranges = [
+        ((candle.high / candle.low) - 1.0) * 100.0
+        for candle in candles[-11:-1]
+        if candle.low > 0
+    ]
+    average_prior_range = mean(prior_ranges) if prior_ranges else current_range
+    ema9 = calculate_ema(closes, 9)
+    ema21 = calculate_ema(closes, 21)
+    return {
+        "rsi": calculate_rsi(closes, rsi_period) or 50.0,
+        "volume_ratio": latest_volume_ratio(candles, lookback=10),
+        "momentum_3_pct": ((latest / closes[-4]) - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] > 0 else 0.0,
+        "momentum_8_pct": ((latest / closes[-9]) - 1.0) * 100.0 if len(closes) >= 9 and closes[-9] > 0 else 0.0,
+        "ema9_gap_pct": ((latest / ema9) - 1.0) * 100.0 if ema9 and ema9 > 0 else 0.0,
+        "ema21_gap_pct": ((latest / ema21) - 1.0) * 100.0 if ema21 and ema21 > 0 else 0.0,
+        "recent_high_gap_pct": ((recent_high / latest) - 1.0) * 100.0 if recent_high > 0 else 0.0,
+        "distance_from_low_pct": ((latest / recent_low) - 1.0) * 100.0 if recent_low > 0 else 0.0,
+        "range_expansion_ratio": current_range / average_prior_range if average_prior_range > 0 else 1.0,
+        "close_position": 1.0
+        if candles[-1].high <= candles[-1].low
+        else (candles[-1].close - candles[-1].low) / (candles[-1].high - candles[-1].low),
+    }
+
+
 def estimate_expected_upside_pct(candles: list[Candle], target_upside_pct: float, lookback: int = 30) -> float:
     recent = candles[-lookback:]
     if not recent:
@@ -451,7 +569,7 @@ def estimate_trend_follow_through_pct(candles: list[Candle], target_upside_pct: 
 
 def estimate_signal_expected_upside_pct(candles: list[Candle], signal: Signal, config: StrategyConfig) -> float:
     reason = signal.reason.lower()
-    if "trend breakout setup" in reason or "pullback continuation setup" in reason or "micro recovery setup" in reason:
+    if "trend breakout setup" in reason or "pullback continuation setup" in reason or "micro recovery setup" in reason or "chart ai setup" in reason:
         return estimate_trend_follow_through_pct(candles, config.target_upside_pct)
     return estimate_expected_upside_pct(candles, config.target_upside_pct)
 

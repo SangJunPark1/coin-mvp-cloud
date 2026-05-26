@@ -21,6 +21,7 @@ from .strategy import (
     bollinger_lower_rebound_quality,
     btc_regime_allows_entries,
     calculate_ema,
+    chart_feature_snapshot,
     estimate_expected_downside_pct,
     estimate_signal_expected_upside_pct,
     latest_volume_ratio,
@@ -573,6 +574,20 @@ class MultiMarketTradingApp:
                 f"validated micro recovery ok: recovery {recovery_momentum:.2f}%, "
                 f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
             )
+        if "chart ai setup" in signal.reason:
+            if not recovered_price and one_candle_recovery < -0.08:
+                return False, (
+                    "validated recovery blocked: "
+                    f"chart recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
+                )
+            if volume_ratio < max(0.85, self.config.strategy.min_volume_ratio * 0.68):
+                return False, f"validated recovery blocked: chart volume {volume_ratio:.2f}x"
+            if close_position < 0.46:
+                return False, f"validated recovery blocked: weak chart close position {close_position:.2f}"
+            return True, (
+                f"validated chart ai ok: recovery {recovery_momentum:.2f}%, "
+                f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
+            )
         if not recovered_price or not strong_recovery:
             return False, (
                 "validated recovery blocked: "
@@ -613,7 +628,7 @@ class MultiMarketTradingApp:
         if signal is not None and self.config.risk.adaptive_position_sizing:
             multiplier *= self._performance_position_multiplier(market or "", self._entry_strategy_name(signal))
             multiplier *= self._conviction_position_multiplier(signal, score)
-        return max(0.0, base * multiplier)
+        return min(self.config.risk.max_position_fraction, max(0.0, base * multiplier))
 
     def _conviction_position_multiplier(self, signal: Signal, score: float | None) -> float:
         if score is None:
@@ -638,6 +653,8 @@ class MultiMarketTradingApp:
             return max(configured, 0.68)
         if "micro recovery setup" in reason:
             return max(configured, 0.62)
+        if "chart ai setup" in reason:
+            return max(configured, 0.58)
         return configured
 
     def _entry_filter_penalty_for_signal(self, signal: Signal, filter_reason: str, filter_penalty: float) -> float:
@@ -1002,6 +1019,12 @@ class MultiMarketTradingApp:
             return "bollinger_rebound"
         if "range rebound setup" in signal.reason:
             return "range_rebound"
+        if "chart ai setup" in signal.reason:
+            return "chart_ai"
+        if "pullback continuation setup" in signal.reason:
+            return "pullback"
+        if "micro recovery setup" in signal.reason:
+            return "micro_recovery"
         return "trend"
 
     def _apply_range_rebound_exit_grace(
@@ -1227,11 +1250,20 @@ def candidate_score(candles: list[Candle], signal: Signal, config: StrategyConfi
     expected_upside = estimate_signal_expected_upside_pct(candles, signal, config) / 100.0
     expected_downside = estimate_expected_downside_pct(candles, config.stop_loss_pct, config.stop_volatility_multiplier) / 100.0
     net_edge = expected_upside - expected_downside
+    chart = chart_feature_snapshot(candles, config.rsi_period)
+    chart_quality = 0.0
+    if chart:
+        chart_quality += min(max(chart["momentum_3_pct"], 0.0) / 100.0, 0.035)
+        chart_quality += min(max(chart["volume_ratio"] - 0.8, 0.0) * 0.035, 0.045)
+        chart_quality += min(max(chart["close_position"] - 0.45, 0.0) * 0.08, 0.04)
+        if "chart ai setup" in signal.reason.lower():
+            chart_quality += 0.04
     return (
         signal.confidence
         + momentum
         + expected_upside
         + max(net_edge, -0.03)
+        + chart_quality
         - expected_downside * 0.6
         - pullback_risk
         + min(volume_value / 1_000_000_000_000.0, 0.25)
@@ -1268,6 +1300,8 @@ def strategy_name_from_reason(reason: str) -> str:
         return "pullback"
     if "micro recovery setup" in text:
         return "micro_recovery"
+    if "chart ai setup" in text:
+        return "chart_ai"
     return "trend"
 
 

@@ -10,7 +10,7 @@ from .config import AiDecisionConfig, StrategyConfig
 from .market_context import DecisionContext
 from .ml_decision import score_entry_with_feature_model
 from .models import Candle, Signal
-from .strategy import estimate_expected_downside_pct, estimate_signal_expected_upside_pct, recent_volatility_pct
+from .strategy import chart_feature_snapshot, estimate_expected_downside_pct, estimate_signal_expected_upside_pct, recent_volatility_pct
 
 
 @dataclass(frozen=True)
@@ -130,6 +130,7 @@ def build_decision_input(
     latest = closes[-1] if closes else 0.0
     recent_high = max((candle.high for candle in candles[-30:]), default=latest)
     recent_low = min((candle.low for candle in candles[-30:]), default=latest)
+    chart_features = chart_feature_snapshot(candles, strategy.rsi_period)
     return {
         "schema_version": "decision-input-v1",
         "candidate": {
@@ -143,6 +144,8 @@ def build_decision_input(
             "recent_high": recent_high,
             "recent_low": recent_low,
             "recent_volatility_pct": recent_volatility_pct(candles),
+            "chart_quality_score": chart_quality_score(chart_features),
+            "chart_features": chart_features,
         },
         "market_context": context.to_dict(),
         "strategy_limits": {
@@ -153,6 +156,22 @@ def build_decision_input(
             "max_entry_rsi": strategy.max_entry_rsi,
         },
     }
+
+
+def chart_quality_score(features: dict[str, float]) -> float:
+    if not features:
+        return 0.0
+    score = 0.0
+    score += min(max(features["momentum_3_pct"], 0.0) / 2.5, 0.22)
+    score += min(max(features["volume_ratio"] - 0.8, 0.0) / 2.8, 0.20)
+    score += min(max(features["close_position"] - 0.45, 0.0) / 1.2, 0.18)
+    if 38.0 <= features["rsi"] <= 68.0:
+        score += 0.14
+    if features["ema9_gap_pct"] >= -0.2 and features["ema21_gap_pct"] >= -0.45:
+        score += 0.16
+    if features["range_expansion_ratio"] >= 1.1:
+        score += 0.10
+    return min(score, 1.0)
 
 
 def decision_grade(confidence: float, expected_upside: float, expected_downside: float, allows_entries: bool) -> str:

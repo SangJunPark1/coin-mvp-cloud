@@ -32,6 +32,7 @@ def score_entry_with_feature_model(decision_input: dict[str, Any]) -> ModelScore
     logit += features["recent_volatility_pct"] * 0.10
     logit += features["btc_momentum_pct"] * 0.35
     logit += features["news_sentiment_score"] * 0.45
+    logit += features["chart_quality_score"] * 0.75
     logit -= min(features["news_risk_headline_count"], 5.0) * 0.08
     logit += setup_bias(str(decision_input.get("candidate", {}).get("signal_reason", "")))
     probability = 1.0 / (1.0 + math.exp(-logit))
@@ -40,6 +41,8 @@ def score_entry_with_feature_model(decision_input: dict[str, Any]) -> ModelScore
         notes.append("News model detected elevated headline risk.")
     if features["expected_downside_pct"] >= features["expected_upside_pct"]:
         notes.append("Feature model sees poor upside/downside balance.")
+    if features["chart_quality_score"] >= 0.65:
+        notes.append("Chart feature model detected a high-quality technical setup.")
     confidence_adjustment = (probability - 0.5) * 0.18
     return ModelScore(
         probability=probability,
@@ -60,6 +63,7 @@ def extract_features(decision_input: dict[str, Any]) -> dict[str, float]:
         "btc_momentum_pct": as_float(context.get("btc_momentum_pct")),
         "news_sentiment_score": as_float(context.get("news_sentiment_score")),
         "news_risk_headline_count": as_float(context.get("news_risk_headline_count")),
+        "chart_quality_score": as_float(candidate.get("chart_quality_score")),
     }
 
 
@@ -73,6 +77,8 @@ def setup_bias(reason: str) -> float:
         return -0.02
     if "bollinger rebound setup" in normalized:
         return -0.06
+    if "chart ai setup" in normalized:
+        return 0.16
     return 0.0
 
 

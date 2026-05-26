@@ -20,6 +20,7 @@ from coin_mvp.strategy import (
     bollinger_lower_rebound_quality,
     btc_regime_allows_entries,
     calculate_ema,
+    chart_feature_snapshot,
     estimate_expected_downside_pct,
     estimate_expected_upside_pct,
     market_breadth_ratio,
@@ -1091,6 +1092,74 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         self.assertGreater(expectancy, 0.0)
         self.assertEqual(1 / 3, loss_rate)
         self.assertGreater(profit_factor, 1.0)
+
+    def test_chart_ai_signal_can_create_candidate_from_technical_features(self):
+        strategy = MovingAverageStrategy(
+            StrategyConfig(
+                short_window=5,
+                long_window=20,
+                take_profit_pct=1.0,
+                stop_loss_pct=1.0,
+                position_fraction=0.2,
+                min_recent_momentum_pct=2.0,
+                min_volume_ratio=2.0,
+                min_expected_upside_pct=0.8,
+                max_entry_rsi=78.0,
+            )
+        )
+        closes = [
+            100.0,
+            99.7,
+            99.4,
+            99.6,
+            99.2,
+            99.5,
+            99.1,
+            99.4,
+            99.0,
+            99.3,
+            99.1,
+            99.6,
+            99.3,
+            99.9,
+            99.5,
+            100.1,
+            99.8,
+            100.4,
+            100.0,
+            100.7,
+            100.3,
+            101.0,
+        ]
+        volumes = [10.0] * (len(closes) - 1) + [14.0]
+        candles = make_variable_candles(closes, volumes)
+
+        signal = strategy.generate(candles, Position())
+
+        self.assertEqual(signal.side, Side.BUY)
+        self.assertIn("chart ai setup", signal.reason)
+
+    def test_chart_quality_feature_boosts_local_model(self):
+        payload = {
+            "candidate": {
+                "signal_confidence": 0.56,
+                "expected_upside_pct": 1.4,
+                "expected_downside_pct": 0.7,
+                "recent_volatility_pct": 0.4,
+                "chart_quality_score": 0.8,
+                "signal_reason": "chart ai setup: momentum ignition",
+            },
+            "market_context": {
+                "btc_momentum_pct": 0.0,
+                "news_sentiment_score": 0.0,
+                "news_risk_headline_count": 0,
+            },
+        }
+
+        score = score_entry_with_feature_model(payload)
+
+        self.assertGreater(score.probability, 0.6)
+        self.assertIn("chart_quality_score", score.features)
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:
