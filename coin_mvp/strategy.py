@@ -164,7 +164,7 @@ class MovingAverageStrategy:
         if recent_momentum_pct > self.config.max_recent_momentum_pct or ma_distance_pct > self.config.max_ma_distance_pct:
             return False, f"overextended: momentum {recent_momentum_pct:.2f}%, distance {ma_distance_pct:.2f}%", 0.2
         expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
-        if expected_upside_pct < self.config.min_expected_upside_pct:
+        if expected_upside_pct < max(1.65, self.config.min_expected_upside_pct):
             return False, f"insufficient upside: expected {expected_upside_pct:.2f}%", 0.2
         if rsi is not None and rsi > self.config.max_entry_rsi:
             return False, f"overextended: RSI {rsi:.1f}", 0.2
@@ -177,6 +177,8 @@ class MovingAverageStrategy:
             ema_gap_pct = ((latest_price / long_trend_ema) - 1.0) * 100.0 if long_trend_ema > 0 else 0.0
             if ema_gap_pct < -1.8:
                 return False, f"long trend filter blocked: price deeply below EMA{self.config.long_trend_ema_window}", 0.2
+            if ema_gap_pct < 0 and rsi is not None and rsi > 68.0:
+                return False, f"long trend filter blocked: below EMA{self.config.long_trend_ema_window} with RSI {rsi:.1f}", 0.2
             if ema_gap_pct < 0:
                 ema_penalty = min(0.08, abs(ema_gap_pct) / 30.0)
                 ema_text = f"; below EMA{self.config.long_trend_ema_window} {ema_gap_pct:.2f}%"
@@ -206,11 +208,11 @@ class MovingAverageStrategy:
             return None
         if close_position < 0.42:
             return None
-        if volume_ratio < max(0.78, self.config.min_volume_ratio * 0.78):
+        if volume_ratio < max(1.6, self.config.min_volume_ratio):
             return None
-        if expected_upside_pct < max(1.2, self.config.min_expected_upside_pct):
+        if expected_upside_pct < max(1.55, self.config.min_expected_upside_pct):
             return None
-        if rsi is not None and not 28.0 <= rsi <= 72.0:
+        if rsi is not None and not 28.0 <= rsi <= 66.0:
             return None
         confidence = min(
             0.68,
@@ -249,9 +251,9 @@ class MovingAverageStrategy:
         distance_from_low = features["distance_from_low_pct"]
         range_expansion = features["range_expansion_ratio"]
         expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
-        if expected_upside_pct < max(0.7, self.config.min_expected_upside_pct * 0.62):
+        if expected_upside_pct < max(1.2, self.config.min_expected_upside_pct * 0.90):
             return None
-        if rsi > min(78.0, self.config.max_entry_rsi + 8.0) or rsi < 30.0:
+        if rsi > min(68.0, self.config.max_entry_rsi) or rsi < 32.0:
             return None
         if close_position < 0.46:
             return None
@@ -261,29 +263,36 @@ class MovingAverageStrategy:
         if (
             ema9_gap >= -0.18
             and ema21_gap >= -0.35
-            and momentum_3 >= 0.08
-            and volume_ratio >= max(0.95, self.config.min_volume_ratio * 0.70)
-            and close_position >= 0.56
+            and momentum_3 >= 0.22
+            and momentum_8 >= 0.28
+            and volume_ratio >= max(1.25, self.config.min_volume_ratio)
+            and recent_high_gap <= 0.50
+            and close_position >= 0.62
+            and expected_upside_pct >= 1.8
         ):
             setup = "momentum ignition"
             base_confidence = 0.58
         elif (
             distance_from_low <= 2.8
-            and momentum_3 >= 0.10
+            and momentum_3 >= 0.25
             and momentum_8 >= 0.20
-            and volume_ratio >= 0.82
+            and volume_ratio >= max(1.35, self.config.min_volume_ratio)
             and close_position >= 0.55
-            and 36.0 <= rsi <= 62.0
+            and 36.0 <= rsi <= 58.0
             and latest_price >= short_ma * 0.992
+            and expected_upside_pct >= 1.8
         ):
             setup = "pullback reclaim"
             base_confidence = 0.55
         elif (
             range_expansion >= 1.15
-            and volume_ratio >= max(0.95, self.config.min_volume_ratio * 0.68)
-            and momentum_3 >= 0.03
-            and recent_high_gap <= 1.6
-            and close_position >= 0.58
+            and volume_ratio >= max(2.0, self.config.min_volume_ratio * 1.5)
+            and momentum_3 >= 0.35
+            and momentum_8 >= 0.35
+            and recent_high_gap <= 0.85
+            and close_position >= 0.62
+            and rsi <= 66.0
+            and expected_upside_pct >= 2.0
         ):
             setup = "volatility expansion"
             base_confidence = 0.56

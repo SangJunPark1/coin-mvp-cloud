@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from coin_mvp.broker import PaperBroker
 from coin_mvp.ai_decision import extract_openai_json, review_entry_candidate
 from coin_mvp.backtest import backtest_verdict, candidate_stats, top_blocked_reasons
+from coin_mvp.cloud_tick import resume_state
 from coin_mvp.config import AiDecisionConfig, AppConfig, PathConfig, RiskConfig, StrategyConfig
 from coin_mvp.data import UpbitPublicDataSource
 from coin_mvp.market_context import DecisionContext, maybe_float
@@ -33,6 +34,7 @@ from coin_mvp.watch_multi import (
     orderbook_imbalance_penalty,
     orderbook_spread_penalty,
     performance_stats,
+    reason_bucket_from_reason,
     strategy_name_from_reason,
 )
 
@@ -255,6 +257,28 @@ class RiskManagerTest(unittest.TestCase):
 
 
 class ReportMetricsTest(unittest.TestCase):
+    def test_resume_state_clears_halt_without_resetting_cash(self):
+        state = {
+            "tick": 65,
+            "equity": 989_696.0,
+            "broker": {"cash": 989_696.0, "positions": {}},
+            "risk": {
+                "starting_equity": 1_000_000.0,
+                "consecutive_losses": 1,
+                "halted": True,
+                "halt_reason": "daily loss limit reached: -1.03%",
+                "halt_started_tick": 40,
+                "halt_until_tick": 44,
+            },
+        }
+
+        resumed = resume_state(state)
+
+        self.assertEqual(989_696.0, resumed["broker"]["cash"])
+        self.assertEqual(989_696.0, resumed["risk"]["starting_equity"])
+        self.assertFalse(resumed["risk"]["halted"])
+        self.assertEqual("", resumed["risk"]["halt_reason"])
+
     def test_max_drawdown_uses_cumulative_realized_pnl(self):
         self.assertEqual(calculate_max_drawdown([1000, -300, -500, 200]), -800)
 
@@ -451,7 +475,7 @@ class StrategyFilterTest(unittest.TestCase):
         )
         candles = make_variable_candles(
             [100, 99.8, 99.6, 99.5, 99.4, 98.5, 99.0, 99.3, 99.55, 99.7],
-            [10, 10, 10, 10, 10, 10, 10, 11, 12, 14],
+            [10, 10, 10, 10, 10, 10, 10, 11, 12, 20],
         )
 
         signal = MovingAverageStrategy(config).generate(candles, Position())
@@ -1042,6 +1066,67 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("strategy disabled", reason)
 
+    def test_reason_bucket_gate_blocks_repeated_losing_setup(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(
+                app.config.risk,
+                reason_exit_sample_size=2,
+                min_reason_expectancy_krw=0.0,
+                max_reason_loss_rate=0.8,
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            trade_path = Path(tmp) / "trades.csv"
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        "timestamp,market,side,price,qty,fee,cash_after,position_qty_after,realized_pnl,reason",
+                        "2026-05-25T00:00:00+00:00,KRW-A,buy,100,1,1,900000,1,0,chart ai setup: pullback reclaim",
+                        "2026-05-25T00:01:00+00:00,KRW-A,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:02:00+00:00,KRW-B,buy,100,1,1,900000,1,0,chart ai setup: pullback reclaim",
+                        "2026-05-25T00:03:00+00:00,KRW-B,sell,98,1,1,998000,0,-2000,stop",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app.performance_gate = app.performance_gate.__class__(trade_path)
+
+            ok, reason = app._reason_bucket_performance_allows_entry(
+                Signal(Side.BUY, "chart ai setup: pullback reclaim", 100.0, 0.7)
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("reason disabled: chart_ai_pullback_reclaim", reason)
+
+    def test_reason_bucket_position_multiplier_reduces_losing_setup(self):
+        app = make_test_app()
+        app.config = replace(app.config, risk=replace(app.config.risk, reason_exit_sample_size=3))
+        with TemporaryDirectory() as tmp:
+            trade_path = Path(tmp) / "trades.csv"
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        "timestamp,market,side,price,qty,fee,cash_after,position_qty_after,realized_pnl,reason",
+                        "2026-05-25T00:00:00+00:00,KRW-A,buy,100,1,1,900000,1,0,micro recovery setup",
+                        "2026-05-25T00:01:00+00:00,KRW-A,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:02:00+00:00,KRW-B,buy,100,1,1,900000,1,0,micro recovery setup",
+                        "2026-05-25T00:03:00+00:00,KRW-B,sell,99,1,1,999000,0,-1000,stop",
+                        "2026-05-25T00:04:00+00:00,KRW-C,buy,100,1,1,900000,1,0,micro recovery setup",
+                        "2026-05-25T00:05:00+00:00,KRW-C,sell,101,1,1,1000200,0,200,target",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app.performance_gate = app.performance_gate.__class__(trade_path)
+
+            multiplier = app._reason_bucket_position_multiplier(Signal(Side.BUY, "micro recovery setup", 100.0, 0.7))
+
+        self.assertLess(multiplier, 1.0)
+
     def test_market_mode_allows_micro_recovery_in_neutral(self):
         app = make_test_app()
         context = DecisionContext(
@@ -1111,6 +1196,7 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
     def test_strategy_name_from_reason_and_performance_stats(self):
         self.assertEqual("pullback", strategy_name_from_reason("pullback continuation setup: trend 0.3%"))
+        self.assertEqual("chart_ai_momentum_ignition", reason_bucket_from_reason("chart ai setup: momentum ignition"))
         expectancy, profit_factor, loss_rate = performance_stats([1000.0, -500.0, 500.0])
         self.assertGreater(expectancy, 0.0)
         self.assertEqual(1 / 3, loss_rate)
@@ -1128,6 +1214,7 @@ class RangeReboundExitGraceTest(unittest.TestCase):
                 min_volume_ratio=2.0,
                 min_expected_upside_pct=0.8,
                 max_entry_rsi=78.0,
+                min_validated_recovery_pct=2.0,
             )
         )
         closes = [
@@ -1154,11 +1241,18 @@ class RangeReboundExitGraceTest(unittest.TestCase):
             100.3,
             101.0,
         ]
-        volumes = [10.0] * (len(closes) - 1) + [14.0]
+        volumes = [10.0] * (len(closes) - 1) + [24.0]
         candles = make_variable_candles(closes, volumes)
 
-        signal = strategy.generate(candles, Position())
+        closes_for_ma = [candle.close for candle in candles]
+        signal = strategy._chart_ai_signal(  # noqa: SLF001 - this verifies the chart model path directly.
+            candles,
+            sum(closes_for_ma[-strategy.config.short_window :]) / strategy.config.short_window,
+            sum(closes_for_ma[-strategy.config.long_window :]) / strategy.config.long_window,
+        )
 
+        self.assertIsNotNone(signal)
+        assert signal is not None
         self.assertEqual(signal.side, Side.BUY)
         self.assertIn("chart ai setup", signal.reason)
 

@@ -21,6 +21,7 @@ from .strategy import (
     bollinger_lower_rebound_quality,
     btc_regime_allows_entries,
     calculate_ema,
+    calculate_rsi,
     chart_feature_snapshot,
     estimate_expected_downside_pct,
     estimate_signal_expected_upside_pct,
@@ -81,6 +82,7 @@ class StrategyPerformanceGate:
                         {
                             "market": market,
                             "strategy": strategy_name_from_reason(str(entry.get("reason") or "")),
+                            "reason_bucket": reason_bucket_from_reason(str(entry.get("reason") or "")),
                             "pnl": pnl,
                         }
                     )
@@ -566,10 +568,13 @@ class MultiMarketTradingApp:
                     "validated recovery blocked: "
                     f"micro recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
                 )
-            if volume_ratio < max(0.78, self.config.strategy.min_volume_ratio * 0.78):
+            if volume_ratio < max(1.6, self.config.strategy.min_volume_ratio):
                 return False, f"validated recovery blocked: micro volume {volume_ratio:.2f}x"
             if close_position < 0.42:
                 return False, f"validated recovery blocked: weak micro close position {close_position:.2f}"
+            rsi = calculate_rsi(closes, self.config.strategy.rsi_period)
+            if rsi is not None and rsi > 66.0:
+                return False, f"validated recovery blocked: micro RSI {rsi:.1f}"
             return True, (
                 f"validated micro recovery ok: recovery {recovery_momentum:.2f}%, "
                 f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
@@ -580,6 +585,25 @@ class MultiMarketTradingApp:
                     "validated recovery blocked: "
                     f"chart recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
                 )
+            features = chart_feature_snapshot(candles, self.config.strategy.rsi_period)
+            if features and "momentum ignition" in signal.reason:
+                if features["momentum_8_pct"] < 0.28:
+                    return False, f"validated recovery blocked: chart momentum8 {features['momentum_8_pct']:.2f}%"
+                if features["recent_high_gap_pct"] > 0.50:
+                    return False, f"validated recovery blocked: chart high gap {features['recent_high_gap_pct']:.2f}%"
+            if features and "pullback reclaim" in signal.reason:
+                if features["momentum_3_pct"] < 0.25:
+                    return False, f"validated recovery blocked: chart pullback momentum3 {features['momentum_3_pct']:.2f}%"
+                if features["rsi"] > 58.0:
+                    return False, f"validated recovery blocked: chart pullback RSI {features['rsi']:.1f}"
+            if features and "volatility expansion" in signal.reason:
+                if features["momentum_3_pct"] < 0.35 or features["momentum_8_pct"] < 0.35:
+                    return False, (
+                        "validated recovery blocked: chart expansion momentum "
+                        f"{features['momentum_3_pct']:.2f}%/{features['momentum_8_pct']:.2f}%"
+                    )
+                if features["volume_ratio"] < max(2.0, self.config.strategy.min_volume_ratio * 1.5):
+                    return False, f"validated recovery blocked: chart expansion volume {features['volume_ratio']:.2f}x"
             if volume_ratio < max(0.85, self.config.strategy.min_volume_ratio * 0.68):
                 return False, f"validated recovery blocked: chart volume {volume_ratio:.2f}x"
             if close_position < 0.46:
@@ -627,6 +651,7 @@ class MultiMarketTradingApp:
             multiplier *= 0.85
         if signal is not None and self.config.risk.adaptive_position_sizing:
             multiplier *= self._performance_position_multiplier(market or "", self._entry_strategy_name(signal))
+            multiplier *= self._reason_bucket_position_multiplier(signal)
             multiplier *= self._conviction_position_multiplier(signal, score)
         return min(self.config.risk.max_position_fraction, max(0.0, base * multiplier))
 
@@ -726,6 +751,9 @@ class MultiMarketTradingApp:
         strategy_ok, strategy_reason = self._strategy_performance_allows_entry(strategy_name)
         if not strategy_ok:
             return False, strategy_reason
+        reason_ok, reason = self._reason_bucket_performance_allows_entry(signal)
+        if not reason_ok:
+            return False, reason
         market_ok, market_reason = self._market_performance_allows_entry(market)
         if not market_ok:
             return False, market_reason
@@ -775,6 +803,25 @@ class MultiMarketTradingApp:
             return False, f"market disabled: {market} loss rate {loss_rate:.0%}"
         return True, f"market performance ok: {market}"
 
+    def _reason_bucket_performance_allows_entry(self, signal: Signal) -> tuple[bool, str]:
+        sample_size = self.config.risk.reason_exit_sample_size
+        if sample_size <= 0:
+            return True, "reason performance gate disabled"
+        bucket = self._entry_reason_bucket(signal)
+        pnls = [
+            float(item["pnl"])
+            for item in self.performance_gate.round_trips()
+            if item.get("reason_bucket") == bucket
+        ][-sample_size:]
+        if len(pnls) < sample_size:
+            return True, f"reason performance warming up: {bucket} {len(pnls)}/{sample_size}"
+        expectancy, profit_factor, loss_rate = performance_stats(pnls)
+        if expectancy < self.config.risk.min_reason_expectancy_krw:
+            return False, f"reason disabled: {bucket} expectancy {expectancy:.0f} KRW"
+        if loss_rate > self.config.risk.max_reason_loss_rate:
+            return False, f"reason disabled: {bucket} loss rate {loss_rate:.0%}"
+        return True, f"reason performance ok: {bucket} pf {profit_factor:.2f}"
+
     def _performance_position_multiplier(self, market: str, strategy_name: str) -> float:
         trips = self.performance_gate.round_trips()
         strategy_sample = [float(item["pnl"]) for item in trips if item.get("strategy") == strategy_name][-self.config.risk.strategy_exit_sample_size :]
@@ -791,6 +838,27 @@ class MultiMarketTradingApp:
             elif profit_factor < 1.15:
                 multiplier *= 0.88
         return max(0.45, min(1.18, multiplier))
+
+    def _reason_bucket_position_multiplier(self, signal: Signal) -> float:
+        sample_size = self.config.risk.reason_exit_sample_size
+        if sample_size <= 0:
+            return 1.0
+        bucket = self._entry_reason_bucket(signal)
+        sample = [
+            float(item["pnl"])
+            for item in self.performance_gate.round_trips()
+            if item.get("reason_bucket") == bucket
+        ][-sample_size:]
+        if len(sample) < 2:
+            return 1.0
+        expectancy, profit_factor, loss_rate = performance_stats(sample)
+        if expectancy > 0 and profit_factor >= 1.45 and loss_rate <= 0.4:
+            return 1.12
+        if expectancy < 0 or profit_factor < 1.0 or loss_rate >= 0.67:
+            return 0.58
+        if profit_factor < 1.15:
+            return 0.82
+        return 1.0
 
     def _recent_performance_allows_entries(self) -> tuple[bool, str]:
         sample_size = self.config.risk.recent_exit_sample_size
@@ -1033,6 +1101,9 @@ class MultiMarketTradingApp:
         if "micro recovery setup" in signal.reason:
             return "micro_recovery"
         return "trend"
+
+    def _entry_reason_bucket(self, signal: Signal) -> str:
+        return reason_bucket_from_reason(signal.reason)
 
     def _apply_range_rebound_exit_grace(
         self,
@@ -1310,6 +1381,31 @@ def strategy_name_from_reason(reason: str) -> str:
     if "chart ai setup" in text:
         return "chart_ai"
     return "trend"
+
+
+def reason_bucket_from_reason(reason: str) -> str:
+    text = reason.lower()
+    if "chart ai setup: pullback reclaim" in text:
+        return "chart_ai_pullback_reclaim"
+    if "chart ai setup: momentum ignition" in text:
+        return "chart_ai_momentum_ignition"
+    if "chart ai setup" in text:
+        return "chart_ai_other"
+    if "micro recovery setup" in text:
+        return "micro_recovery"
+    if "pullback continuation setup" in text:
+        if "below ema200" in text:
+            return "pullback_below_ema200"
+        return "pullback_continuation"
+    if "trend breakout setup" in text:
+        if "momentum 0." in text:
+            return "trend_low_momentum"
+        return "trend_breakout"
+    if "range rebound setup" in text:
+        return "range_rebound"
+    if "bollinger rebound setup" in text:
+        return "bollinger_rebound"
+    return strategy_name_from_reason(reason)
 
 
 def performance_stats(pnls: list[float]) -> tuple[float, float, float]:

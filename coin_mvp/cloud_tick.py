@@ -46,6 +46,7 @@ def run_cloud_ticks(
     ticks: int = 1,
     outputs: list[Path] | None = None,
     reset: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     loaded_config = load_config(config_path)
     storage = get_cloud_storage()
@@ -79,8 +80,25 @@ def run_cloud_ticks(
         storage.hydrate(config)
 
     state = load_state(config.paths.state_file)
+    if resume and state:
+        state = resume_state(state)
+        config.paths.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        if ticks <= 0:
+            refresh_outputs(config, outputs)
+            storage.persist(config)
+            return {
+                "ok": True,
+                "resumed": True,
+                "tick": int(state.get("tick", 0)),
+                "cash": state.get("broker", {}).get("cash"),
+                "equity": state.get("equity"),
+                "positions": state.get("broker", {}).get("positions", {}),
+                "risk": state.get("risk", {}),
+                "outputs": [str(output) for output in outputs],
+                "storage": "remote" if storage.enabled else "local",
+            }
     cooldown = int(config.poll_seconds)
-    if state and cooldown > 0 and not reset:
+    if state and cooldown > 0 and not reset and not resume:
         last_run_at = parse_kst_time(str(state.get("last_run_at") or ""))
         now = datetime.now(KST)
         if last_run_at is not None and now < last_run_at + timedelta(seconds=cooldown):
@@ -140,6 +158,27 @@ def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def resume_state(state: dict[str, Any]) -> dict[str, Any]:
+    risk = state.get("risk")
+    if not isinstance(risk, dict):
+        risk = {}
+        state["risk"] = risk
+    equity = state.get("equity")
+    try:
+        current_equity = float(equity)
+    except (TypeError, ValueError):
+        current_equity = float(state.get("broker", {}).get("cash", 0.0) or 0.0)
+    if current_equity > 0:
+        risk["starting_equity"] = current_equity
+    risk["halted"] = False
+    risk["halt_reason"] = ""
+    risk["halt_started_tick"] = None
+    risk["halt_until_tick"] = None
+    risk["consecutive_losses"] = min(int(risk.get("consecutive_losses", 0) or 0), 1)
+    state["last_run_at"] = datetime.now(KST).isoformat(timespec="seconds")
+    return state
 
 
 def parse_kst_time(value: str) -> datetime | None:

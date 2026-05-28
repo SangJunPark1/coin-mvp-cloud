@@ -101,6 +101,9 @@ class RiskConfig:
     min_market_expectancy_krw: float = 0.0
     max_strategy_loss_rate: float = 0.67
     max_market_loss_rate: float = 0.75
+    reason_exit_sample_size: int = 3
+    min_reason_expectancy_krw: float = 0.0
+    max_reason_loss_rate: float = 0.67
     adaptive_position_sizing: bool = True
 
 
@@ -245,6 +248,9 @@ def load_config(path: str | Path) -> AppConfig:
             min_market_expectancy_krw=float(risk.get("min_market_expectancy_krw", 0.0)),
             max_strategy_loss_rate=float(risk.get("max_strategy_loss_rate", 0.67)),
             max_market_loss_rate=float(risk.get("max_market_loss_rate", 0.75)),
+            reason_exit_sample_size=int(risk.get("reason_exit_sample_size", 3)),
+            min_reason_expectancy_krw=float(risk.get("min_reason_expectancy_krw", 0.0)),
+            max_reason_loss_rate=float(risk.get("max_reason_loss_rate", 0.67)),
             adaptive_position_sizing=bool(risk.get("adaptive_position_sizing", True)),
         ),
         ai_decision=AiDecisionConfig(
