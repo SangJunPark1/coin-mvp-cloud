@@ -561,7 +561,7 @@ class MultiMarketTradingApp:
                 f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
             )
         if "micro recovery setup" in signal.reason:
-            if not recovered_price and one_candle_recovery < -0.03:
+            if recovery_momentum < 0.20 or one_candle_recovery < 0.10:
                 return False, (
                     "validated recovery blocked: "
                     f"micro recovery {recovery_momentum:.2f}%, one-candle {one_candle_recovery:.2f}%"
@@ -634,6 +634,15 @@ class MultiMarketTradingApp:
         if score is None:
             return 1.0
         edge = score - self.config.risk.min_candidate_score
+        reason = signal.reason.lower()
+        if "chart ai setup: pullback reclaim" in reason:
+            return 0.82
+        if "chart ai setup" in reason:
+            return 0.95
+        if "micro recovery setup" in reason:
+            if signal.confidence >= 0.66 and edge >= 0.08:
+                return 0.95
+            return 0.78
         if signal.confidence >= 0.76 and edge >= 0.18:
             return 1.35
         if signal.confidence >= 0.70 and edge >= 0.10:
@@ -728,8 +737,6 @@ class MultiMarketTradingApp:
             return False, "market mode blocked: capital protect"
         if mode == "risk_off" and strategy_name in {"trend", "micro_recovery"}:
             return False, f"market mode blocked: {mode} rejects {strategy_name}"
-        if mode == "neutral" and strategy_name == "micro_recovery":
-            return False, "market mode blocked: neutral rejects micro recovery"
         return True, "market mode ok"
 
     def _strategy_performance_allows_entry(self, strategy_name: str) -> tuple[bool, str]:

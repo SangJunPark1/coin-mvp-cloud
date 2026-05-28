@@ -186,6 +186,28 @@ class RiskManagerTest(unittest.TestCase):
         approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=12)
         self.assertTrue(approved)
 
+    def test_daily_loss_cooldown_rebases_equity_after_pause(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=1.0,
+                max_entries_per_day=12,
+                max_position_fraction=0.35,
+                max_consecutive_losses=4,
+                halt_cooldown_ticks=2,
+            ),
+            starting_equity=1_000_000,
+        )
+
+        approved, reason = risk.approve(Signal(Side.BUY, "test", price=100.0), 989_000, 0.2, tick=10)
+        self.assertFalse(approved)
+        self.assertIn("daily loss limit", reason)
+
+        approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 989_000, 0.2, tick=12)
+        self.assertTrue(approved)
+        self.assertEqual(989_000, risk.state.starting_equity)
+        self.assertFalse(risk.state.halted)
+
     def test_consecutive_loss_cooldown_resets_loss_counter(self):
         risk = RiskManager(
             RiskConfig(
@@ -421,14 +443,15 @@ class StrategyFilterTest(unittest.TestCase):
             take_profit_pct=1.0,
             stop_loss_pct=1.0,
             position_fraction=0.2,
+            min_recent_momentum_pct=1.0,
             min_volume_ratio=1.0,
-            min_expected_upside_pct=1.2,
+            min_expected_upside_pct=0.8,
             long_trend_ema_window=0,
             rsi_period=5,
         )
         candles = make_variable_candles(
-            [100, 99.8, 99.6, 99.5, 99.4, 99.3, 99.2, 99.25, 99.28, 99.30],
-            [10, 10, 10, 10, 10, 10, 10, 11, 11, 12],
+            [100, 99.8, 99.6, 99.5, 99.4, 98.5, 99.0, 99.3, 99.55, 99.7],
+            [10, 10, 10, 10, 10, 10, 10, 11, 12, 14],
         )
 
         signal = MovingAverageStrategy(config).generate(candles, Position())
@@ -1019,7 +1042,7 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("strategy disabled", reason)
 
-    def test_market_mode_blocks_micro_recovery_in_neutral(self):
+    def test_market_mode_allows_micro_recovery_in_neutral(self):
         app = make_test_app()
         context = DecisionContext(
             allows_entries=True,
@@ -1032,8 +1055,8 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         ok, reason = app._market_mode_allows_strategy("micro_recovery", context)
 
-        self.assertFalse(ok)
-        self.assertIn("neutral rejects micro recovery", reason)
+        self.assertTrue(ok)
+        self.assertEqual("market mode ok", reason)
 
     def test_performance_position_multiplier_reduces_weak_market(self):
         app = make_test_app()

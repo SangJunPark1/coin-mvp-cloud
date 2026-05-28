@@ -48,7 +48,7 @@ class RiskManager:
 
     def refresh_halt(self, current_equity: float, tick: int | None = None) -> None:
         self._shorten_consecutive_loss_cooldown()
-        self._release_expired_cooldown(tick)
+        self._release_expired_cooldown(tick, current_equity)
         self._update_halt_from_equity(current_equity, tick)
 
     def approve(self, signal: Signal, current_equity: float, position_fraction: float, tick: int | None = None) -> tuple[bool, str]:
@@ -102,13 +102,15 @@ class RiskManager:
         self.state.halt_started_tick = tick
         self.state.halt_until_tick = None if tick is None or cooldown_ticks <= 0 else tick + cooldown_ticks
 
-    def _release_expired_cooldown(self, tick: int | None) -> None:
+    def _release_expired_cooldown(self, tick: int | None, current_equity: float) -> None:
         if not self.state.halted or tick is None or self.state.halt_until_tick is None:
             return
         if tick < self.state.halt_until_tick:
             return
         if self.state.halt_reason == "max consecutive losses reached":
             self.state.consecutive_losses = 0
+        elif self.state.halt_reason.startswith("daily loss limit reached"):
+            self.state.starting_equity = current_equity
         self.state.halted = False
         self.state.halt_reason = ""
         self.state.halt_started_tick = None

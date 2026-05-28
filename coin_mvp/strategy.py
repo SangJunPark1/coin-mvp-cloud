@@ -101,7 +101,7 @@ class MovingAverageStrategy:
         if len(closes) < max(8, self.config.long_window):
             return None
         trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
-        if trend_strength <= 0.05:
+        if trend_strength <= max(0.18, self.config.min_recent_momentum_pct * 0.5):
             return None
         recent = candles[-6:]
         recent_low = min(candle.low for candle in recent)
@@ -201,14 +201,14 @@ class MovingAverageStrategy:
         close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
         expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
         price_near_ma = latest_price >= long_ma * 0.992 or latest_price >= short_ma * 0.996
-        stabilizing = one_candle_pct >= -0.03 and recent_momentum_pct >= -0.35
+        stabilizing = one_candle_pct >= 0.12 and recent_momentum_pct >= 0.25
         if not price_near_ma or not stabilizing:
             return None
         if close_position < 0.42:
             return None
         if volume_ratio < max(0.78, self.config.min_volume_ratio * 0.78):
             return None
-        if expected_upside_pct < 0.45:
+        if expected_upside_pct < max(1.2, self.config.min_expected_upside_pct):
             return None
         if rsi is not None and not 28.0 <= rsi <= 72.0:
             return None
@@ -269,8 +269,8 @@ class MovingAverageStrategy:
             base_confidence = 0.58
         elif (
             distance_from_low <= 2.8
-            and momentum_3 >= -0.05
-            and momentum_8 >= -0.45
+            and momentum_3 >= 0.10
+            and momentum_8 >= 0.20
             and volume_ratio >= 0.82
             and close_position >= 0.55
             and 36.0 <= rsi <= 62.0
