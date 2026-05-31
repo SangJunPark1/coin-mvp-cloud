@@ -13,6 +13,7 @@ from .config import AppConfig, StrategyConfig, load_config
 from .data import UpbitPublicDataSource, sleep_between_ticks
 from .journal import Journal
 from .market_context import collect_decision_context
+from .ml_decision import impulse_quality_score, opportunity_edge_score
 from .models import Candle, Side, Signal
 from .risk import RiskManager
 from .strategy import (
@@ -25,6 +26,7 @@ from .strategy import (
     chart_feature_snapshot,
     estimate_expected_downside_pct,
     estimate_signal_expected_upside_pct,
+    estimate_trend_follow_through_pct,
     latest_volume_ratio,
     market_breadth_ratio,
     mean,
@@ -139,6 +141,18 @@ class MultiMarketTradingApp:
                 },
             )
             return
+        if self.risk.state.consecutive_losses >= 1 and len(self.broker.open_markets()) >= 1:
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": "loss recovery mode: wait for open position to resolve",
+                    "risk": self.risk.state,
+                },
+            )
+            return
         if len(self.broker.open_markets()) >= self.config.risk.max_open_positions:
             return
         self._scan_and_enter(tick)
@@ -218,6 +232,19 @@ class MultiMarketTradingApp:
                     "markets_scanned": 0,
                     "candidates": 0,
                     "reason": context.reason,
+                    "decision_context": context.to_dict(),
+                    "risk": self.risk.state,
+                },
+            )
+            return
+        if str(getattr(context, "market_mode", "neutral")) != "risk_on" and self.broker.open_markets():
+            self.journal.event(
+                "market_scan",
+                {
+                    "tick": tick,
+                    "markets_scanned": 0,
+                    "candidates": 0,
+                    "reason": "neutral mode single-position limit",
                     "decision_context": context.to_dict(),
                     "risk": self.risk.state,
                 },
@@ -492,7 +519,12 @@ class MultiMarketTradingApp:
             imbalance_penalty = orderbook_imbalance_penalty(orderbook.imbalance_ratio, imbalance_limit)
         mtf_ok, mtf_reason, mtf_penalty = self._five_minute_trend_ok(market)
         if not mtf_ok:
-            return True, mtf_reason, 0.0
+            override_ok, override_reason = self._one_minute_opportunity_override(candles)
+            if not override_ok:
+                return True, mtf_reason, 0.0
+            mtf_ok = True
+            mtf_reason = f"{mtf_reason}; {override_reason}"
+            mtf_penalty = max(mtf_penalty, 0.18)
         bollinger_ok, bollinger_reason, bollinger_penalty = self._multi_timeframe_bollinger_ok(market)
         total_penalty = spread_penalty + imbalance_penalty + mtf_penalty
         reasons: list[str] = []
@@ -510,6 +542,36 @@ class MultiMarketTradingApp:
             reasons.append(bollinger_reason)
         reason = "; ".join(reasons) if reasons else mtf_reason
         return False, reason, total_penalty
+
+    def _one_minute_opportunity_override(self, candles: list[Candle]) -> tuple[bool, str]:
+        features = chart_feature_snapshot(candles, self.config.strategy.rsi_period)
+        if not features:
+            return False, "1m opportunity unavailable"
+        expected_upside = estimate_trend_follow_through_pct(candles, self.config.strategy.target_upside_pct)
+        impulse = impulse_quality_score(
+            features["momentum_3_pct"],
+            features["momentum_8_pct"],
+            features["volume_ratio"],
+            features["close_position"],
+            features["rsi"],
+        )
+        if (
+            expected_upside >= 2.6
+            and impulse >= 0.72
+            and features["momentum_3_pct"] >= 0.45
+            and features["momentum_8_pct"] >= 0.70
+            and features["volume_ratio"] >= 2.0
+            and features["close_position"] >= 0.72
+            and 44.0 <= features["rsi"] <= 64.0
+            and features["recent_high_gap_pct"] <= 0.75
+        ):
+            return True, (
+                "1m profit impulse override: "
+                f"edge {impulse:.2f}; momentum3 {features['momentum_3_pct']:.2f}%; "
+                f"momentum8 {features['momentum_8_pct']:.2f}%; volume {features['volume_ratio']:.2f}x; "
+                f"expected {expected_upside:.2f}%"
+            )
+        return False, "1m opportunity not strong enough"
 
     def _reward_risk_ok(self, candles: list[Candle], signal: Signal) -> tuple[bool, str]:
         expected_upside = estimate_signal_expected_upside_pct(candles, signal, self.config.strategy)
@@ -587,8 +649,12 @@ class MultiMarketTradingApp:
                 )
             features = chart_feature_snapshot(candles, self.config.strategy.rsi_period)
             if features and "momentum ignition" in signal.reason:
-                if features["momentum_8_pct"] < 0.28:
+                if features["momentum_8_pct"] < 0.55:
                     return False, f"validated recovery blocked: chart momentum8 {features['momentum_8_pct']:.2f}%"
+                if features["rsi"] > 64.0:
+                    return False, f"validated recovery blocked: chart RSI {features['rsi']:.1f}"
+                if features["close_position"] < 0.75:
+                    return False, f"validated recovery blocked: chart close position {features['close_position']:.2f}"
                 if features["recent_high_gap_pct"] > 0.50:
                     return False, f"validated recovery blocked: chart high gap {features['recent_high_gap_pct']:.2f}%"
             if features and "pullback reclaim" in signal.reason:
@@ -653,6 +719,7 @@ class MultiMarketTradingApp:
             multiplier *= self._performance_position_multiplier(market or "", self._entry_strategy_name(signal))
             multiplier *= self._reason_bucket_position_multiplier(signal)
             multiplier *= self._conviction_position_multiplier(signal, score)
+            multiplier *= self._opportunity_position_multiplier(candles, signal)
         return min(self.config.risk.max_position_fraction, max(0.0, base * multiplier))
 
     def _conviction_position_multiplier(self, signal: Signal, score: float | None) -> float:
@@ -676,6 +743,19 @@ class MultiMarketTradingApp:
             return 1.08
         if edge < 0.02:
             return 0.88
+        return 1.0
+
+    def _opportunity_position_multiplier(self, candles: list[Candle], signal: Signal) -> float:
+        edge = opportunity_score_for_signal(candles, signal, self.config.strategy)
+        reason = signal.reason.lower()
+        if edge >= 0.82 and signal.confidence >= 0.72:
+            return 1.22
+        if edge >= 0.72 and signal.confidence >= 0.66:
+            return 1.12
+        if edge < 0.42:
+            return 0.72 if "micro recovery setup" in reason else 0.82
+        if edge < 0.55:
+            return 0.92
         return 1.0
 
     def _max_downside_to_upside_for_signal(self, signal: Signal) -> float:
@@ -1038,6 +1118,13 @@ class MultiMarketTradingApp:
         dynamic_stop_loss_pct = estimate_expected_downside_pct(candles, self.config.strategy.stop_loss_pct, self.config.strategy.stop_volatility_multiplier)
         if pnl_pct <= -dynamic_stop_loss_pct:
             return Signal(Side.SELL, f"stop loss reached: {pnl_pct:.2f}%", latest_price, 0.95)
+        if pnl_pct >= self.config.strategy.target_upside_pct:
+            return Signal(
+                Side.SELL,
+                f"full take profit reached: {pnl_pct:.2f}%",
+                latest_price,
+                0.9,
+            )
         if not position.partial_exit_taken and pnl_pct >= self.config.strategy.partial_take_profit_pct:
             return Signal(
                 Side.SELL,
@@ -1056,7 +1143,18 @@ class MultiMarketTradingApp:
                 latest_price,
                 0.82,
             )
+        if position.partial_exit_taken:
+            locked_floor_pct = max(0.35, self._roundtrip_cost_pct() * 2.0)
+            if pnl_pct <= locked_floor_pct:
+                return Signal(
+                    Side.SELL,
+                    f"post-partial profit floor reached: peak {peak_pnl_pct:.2f}%, pnl {pnl_pct:.2f}%",
+                    latest_price,
+                    0.86,
+                )
         peak_drawdown_pct = (latest_price / peak_price - 1.0) * 100.0 if peak_price > 0 else 0.0
+        if position.partial_exit_taken and peak_pnl_pct >= 1.8 and peak_drawdown_pct <= -max(0.35, self.config.strategy.trailing_stop_pct * 0.7):
+            return Signal(Side.SELL, f"post-partial trailing lock: {peak_drawdown_pct:.2f}%", latest_price, 0.82)
         if pnl_pct > 0 and peak_drawdown_pct <= -self.config.strategy.trailing_stop_pct:
             return Signal(Side.SELL, f"trailing stop reached: {peak_drawdown_pct:.2f}%", latest_price, 0.75)
         return Signal(Side.HOLD, "position managed", latest_price, 0.2)
@@ -1188,7 +1286,7 @@ class MultiMarketTradingApp:
         if pnl_pct >= 0.25:
             return Signal(Side.SELL, f"trend break profit lock: {pnl_pct:.2f}%", latest_price, signal.confidence)
         held_ticks = tick - entry_tick
-        if pnl_pct > -self.config.strategy.stop_loss_pct * 0.65:
+        if held_ticks <= 2 and pnl_pct > -self.config.strategy.stop_loss_pct * 0.45:
             return Signal(
                 Side.HOLD,
                 f"trend break watch: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
@@ -1336,17 +1434,46 @@ def candidate_score(candles: list[Candle], signal: Signal, config: StrategyConfi
         chart_quality += min(max(chart["close_position"] - 0.45, 0.0) * 0.08, 0.04)
         if "chart ai setup" in signal.reason.lower():
             chart_quality += 0.04
+    opportunity_edge = opportunity_score_for_signal(candles, signal, config)
     return (
         signal.confidence
         + momentum
         + expected_upside
         + max(net_edge, -0.03)
         + chart_quality
+        + opportunity_edge * 0.16
         - expected_downside * 0.6
         - pullback_risk
         + min(volume_value / 1_000_000_000_000.0, 0.25)
         - penalty
     )
+
+
+def opportunity_score_for_signal(candles: list[Candle], signal: Signal, config: StrategyConfig) -> float:
+    chart = chart_feature_snapshot(candles, config.rsi_period)
+    expected_upside = estimate_signal_expected_upside_pct(candles, signal, config)
+    expected_downside = estimate_expected_downside_pct(candles, config.stop_loss_pct, config.stop_volatility_multiplier)
+    reward_risk = expected_upside / expected_downside if expected_downside > 0 else 0.0
+    impulse = 0.0
+    if chart:
+        impulse = impulse_quality_score(
+            chart["momentum_3_pct"],
+            chart["momentum_8_pct"],
+            chart["volume_ratio"],
+            chart["close_position"],
+            chart["rsi"],
+        )
+        return opportunity_edge_score(
+            expected_upside,
+            reward_risk,
+            impulse,
+            chart["momentum_3_pct"],
+            chart["momentum_8_pct"],
+            chart["volume_ratio"],
+            chart["close_position"],
+            chart["rsi"],
+        )
+    return opportunity_edge_score(expected_upside, reward_risk, impulse, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def five_minute_momentum_penalty(momentum_pct: float, min_required_pct: float) -> float:

@@ -151,6 +151,7 @@ class MovingAverageStrategy:
         ma_distance_pct = ((latest_price / long_ma) - 1.0) * 100.0 if long_ma else 0.0
         rsi = calculate_rsi(closes, self.config.rsi_period)
         long_trend_ema = calculate_ema(closes, self.config.long_trend_ema_window)
+        features = chart_feature_snapshot(candles, self.config.rsi_period)
         candle_range = candles[-1].high - candles[-1].low
         close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
         trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
@@ -170,6 +171,8 @@ class MovingAverageStrategy:
             return False, f"overextended: RSI {rsi:.1f}", 0.2
         if volume_ratio < self.config.min_volume_ratio:
             return False, f"thin volume: {volume_ratio:.2f}x", 0.2
+        if features and features["momentum_3_pct"] < 0.25 and expected_upside_pct < 2.5:
+            return False, f"weak short impulse: momentum3 {features['momentum_3_pct']:.2f}%", 0.2
 
         ema_penalty = 0.0
         ema_text = ""
@@ -264,11 +267,12 @@ class MovingAverageStrategy:
             ema9_gap >= -0.18
             and ema21_gap >= -0.35
             and momentum_3 >= 0.22
-            and momentum_8 >= 0.28
-            and volume_ratio >= max(1.25, self.config.min_volume_ratio)
+            and momentum_8 >= 0.55
+            and volume_ratio >= max(1.5, self.config.min_volume_ratio)
             and recent_high_gap <= 0.50
-            and close_position >= 0.62
-            and expected_upside_pct >= 1.8
+            and close_position >= 0.75
+            and rsi <= 64.0
+            and expected_upside_pct >= 2.2
         ):
             setup = "momentum ignition"
             base_confidence = 0.58
@@ -296,6 +300,19 @@ class MovingAverageStrategy:
         ):
             setup = "volatility expansion"
             base_confidence = 0.56
+        elif (
+            ema9_gap >= -0.10
+            and ema21_gap >= -0.20
+            and momentum_3 >= 0.45
+            and momentum_8 >= 0.70
+            and volume_ratio >= max(2.0, self.config.min_volume_ratio * 1.6)
+            and recent_high_gap <= 0.75
+            and close_position >= 0.72
+            and 44.0 <= rsi <= 64.0
+            and expected_upside_pct >= 2.6
+        ):
+            setup = "profit continuation"
+            base_confidence = 0.62
         if not setup:
             return None
 

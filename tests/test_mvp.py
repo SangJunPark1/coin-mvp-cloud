@@ -11,7 +11,7 @@ from coin_mvp.cloud_tick import resume_state
 from coin_mvp.config import AiDecisionConfig, AppConfig, PathConfig, RiskConfig, StrategyConfig
 from coin_mvp.data import UpbitPublicDataSource
 from coin_mvp.market_context import DecisionContext, maybe_float
-from coin_mvp.ml_decision import score_entry_with_feature_model
+from coin_mvp.ml_decision import opportunity_edge_score, score_entry_with_feature_model
 from coin_mvp.models import Candle, OrderbookSnapshot, Position, Side, Signal
 from coin_mvp.news import score_headlines
 from coin_mvp.report import calculate_max_consecutive_losses, calculate_max_drawdown
@@ -33,6 +33,7 @@ from coin_mvp.watch_multi import (
     five_minute_trend_penalty,
     orderbook_imbalance_penalty,
     orderbook_spread_penalty,
+    opportunity_score_for_signal,
     performance_stats,
     reason_bucket_from_reason,
     strategy_name_from_reason,
@@ -607,6 +608,38 @@ class StrategyFilterTest(unittest.TestCase):
         self.assertEqual(decision.grade, "C")
         self.assertTrue(any("downside" in note.lower() for note in decision.risk_notes))
 
+    def test_upgraded_ai_blocks_weak_micro_recovery_impulse(self):
+        config = StrategyConfig(
+            short_window=3,
+            long_window=5,
+            take_profit_pct=1.0,
+            stop_loss_pct=0.65,
+            position_fraction=0.2,
+            min_expected_upside_pct=0.5,
+            target_upside_pct=3.0,
+        )
+        context = DecisionContext(True, "neutral test context", 1.0, 0.0, 0.2, market_mode="neutral")
+        candles = make_variable_candles(
+            [352.0, 353.0, 354.0, 354.0, 354.0, 354.0, 354.0, 354.0, 354.0, 355.0],
+            [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 46.0],
+        )
+
+        decision = review_entry_candidate(
+            Signal(
+                Side.BUY,
+                "micro recovery setup: momentum 0.57%; one-candle 0.28%; close position 0.50; volume 4.61x; expected follow-through 1.99%; RSI 50.0",
+                price=355.0,
+                confidence=0.68,
+            ),
+            candles,
+            context,
+            config,
+            AiDecisionConfig(enabled=True, min_confidence=0.55),
+        )
+
+        self.assertEqual(decision.action, "hold")
+        self.assertTrue(any("AI hard block" in note for note in decision.risk_notes))
+
     def test_orderbook_snapshot_metrics(self):
         snapshot = OrderbookSnapshot(
             market="KRW-BTC",
@@ -959,6 +992,31 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         self.assertEqual(signal.side, Side.SELL)
         self.assertIn("breakeven stop reached", signal.reason)
 
+    def test_full_take_profit_exits_before_partial(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(app.config.strategy, target_upside_pct=3.0, partial_take_profit_pct=1.0),
+        )
+        position = Position(qty=1.0, avg_price=100.0, peak_price=103.8)
+        candles = make_candles([100.0, 101.0, 102.0, 103.0, 103.8], volume=10.0)
+
+        signal = app._position_management_signal(1, "KRW-BTC", candles, 103.8, position)
+
+        self.assertEqual(signal.side, Side.SELL)
+        self.assertEqual(1.0, signal.size_fraction)
+        self.assertIn("full take profit reached", signal.reason)
+
+    def test_post_partial_profit_floor_protects_remaining_position(self):
+        app = make_test_app()
+        position = Position(qty=1.0, avg_price=100.0, peak_price=103.0, partial_exit_taken=True)
+        candles = make_candles([100.0, 102.0, 103.0, 101.0, 100.3], volume=10.0)
+
+        signal = app._position_management_signal(1, "KRW-BTC", candles, 100.3, position)
+
+        self.assertEqual(signal.side, Side.SELL)
+        self.assertIn("post-partial profit floor", signal.reason)
+
     def test_recent_negative_expectancy_blocks_new_entries(self):
         app = make_test_app()
         app.config = replace(
@@ -1277,6 +1335,91 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
         self.assertGreater(score.probability, 0.6)
         self.assertIn("chart_quality_score", score.features)
+
+    def test_opportunity_edge_boosts_profit_seeking_setups(self):
+        weak = opportunity_edge_score(
+            expected_upside_pct=1.8,
+            reward_risk_ratio=1.9,
+            impulse_quality=0.45,
+            momentum_3_pct=0.25,
+            momentum_8_pct=0.35,
+            volume_ratio=1.4,
+            close_position=0.62,
+            rsi=55.0,
+        )
+        strong = opportunity_edge_score(
+            expected_upside_pct=3.2,
+            reward_risk_ratio=3.4,
+            impulse_quality=0.82,
+            momentum_3_pct=0.75,
+            momentum_8_pct=1.15,
+            volume_ratio=3.4,
+            close_position=0.92,
+            rsi=57.0,
+        )
+
+        self.assertLess(weak, 0.45)
+        self.assertGreater(strong, 0.72)
+
+    def test_candidate_score_rewards_high_edge_setup(self):
+        config = StrategyConfig(short_window=5, long_window=20, take_profit_pct=1.0, stop_loss_pct=0.65, position_fraction=0.2)
+        strong_candles = make_variable_candles(
+            [
+                100.0,
+                100.1,
+                100.0,
+                100.2,
+                100.5,
+                100.9,
+                101.4,
+                101.9,
+                102.5,
+                103.0,
+                103.5,
+                104.0,
+                104.6,
+                105.2,
+                105.8,
+                106.4,
+                107.0,
+                107.7,
+                108.4,
+                109.2,
+            ],
+            [10.0] * 17 + [32.0, 36.0, 42.0],
+        )
+        weak_candles = make_variable_candles(
+            [
+                100.0,
+                100.2,
+                100.1,
+                100.2,
+                100.3,
+                100.2,
+                100.4,
+                100.3,
+                100.4,
+                100.5,
+                100.4,
+                100.5,
+                100.6,
+                100.5,
+                100.6,
+                100.7,
+                100.6,
+                100.7,
+                100.8,
+                100.7,
+            ],
+            [10.0] * 20,
+        )
+        strong_signal = Signal(Side.BUY, "trend breakout setup: momentum 0.75%; volume 3.40x; expected follow-through 3.20%", 0.76)
+        weak_signal = Signal(Side.BUY, "trend breakout setup: momentum 0.25%; volume 1.10x; expected follow-through 1.80%", 0.76)
+
+        self.assertGreater(
+            opportunity_score_for_signal(strong_candles, strong_signal, config),
+            opportunity_score_for_signal(weak_candles, weak_signal, config),
+        )
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:

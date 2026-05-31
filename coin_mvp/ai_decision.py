@@ -86,6 +86,7 @@ def review_entry_candidate(
         risk_notes.append(f"OpenAI fallback reason: {fallback_reason}")
 
     grade = decision_grade(confidence, expected_upside, expected_downside, context.allows_entries)
+    hard_block = upgraded_model_hard_block(decision_input, model_score.features)
 
     if not context.allows_entries:
         action = "pause"
@@ -93,12 +94,16 @@ def review_entry_candidate(
     elif expected_downside >= expected_upside:
         action = "hold"
         thesis = "Candidate risk/reward is unfavorable because downside is at least as large as upside."
+    elif hard_block:
+        action = "hold"
+        risk_notes.append(hard_block)
+        thesis = "Upgraded AI model rejected the candidate despite the deterministic setup."
     elif risk_notes and confidence < ai_config.min_confidence + 0.15:
         action = "hold"
         thesis = "Candidate has a deterministic signal, but the risk/reward evidence is not strong enough."
-    elif model_score.probability < 0.53:
+    elif model_score.probability < required_model_probability(decision_input, context):
         action = "hold"
-        thesis = "Local feature model score is too weak for a new entry."
+        thesis = "Upgraded feature model score is too weak for a new entry."
     elif confidence < ai_config.min_confidence or grade == "C":
         action = "hold"
         thesis = "Candidate grade is below the entry threshold."
@@ -182,6 +187,53 @@ def decision_grade(confidence: float, expected_upside: float, expected_downside:
     if confidence >= 0.60 and expected_upside >= 1.2:
         return "B"
     return "C"
+
+
+def required_model_probability(decision_input: dict[str, Any], context: DecisionContext) -> float:
+    reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
+    mode = str(getattr(context, "market_mode", "neutral")).lower()
+    required = 0.66
+    if mode == "neutral":
+        required = 0.74
+    elif mode == "risk_off":
+        required = 0.82
+    elif mode == "risk_on":
+        required = 0.62
+    if "range rebound setup" in reason:
+        required += 0.06
+    if "micro recovery setup" in reason:
+        required += 0.04
+    if "chart ai setup" in reason:
+        required += 0.03
+    return min(required, 0.9)
+
+
+def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str, float]) -> str:
+    reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
+    mode = str(decision_input.get("market_context", {}).get("market_mode", "neutral")).lower()
+    if features.get("reward_risk_ratio", 0.0) < 2.15:
+        return "AI hard block: reward/risk ratio is below 2.15."
+    if features.get("impulse_quality_score", 0.0) < 0.58:
+        return "AI hard block: impulse quality is too weak."
+    if "micro recovery setup" in reason:
+        if mode != "risk_on":
+            return "AI hard block: micro recovery is only allowed in risk-on market mode."
+        if features.get("close_position", 0.0) < 0.65:
+            return "AI hard block: micro recovery close position is weak."
+        if features.get("momentum_8_pct", 0.0) < 0.55:
+            return "AI hard block: micro recovery follow-through momentum is weak."
+        if features.get("expected_upside_pct", 0.0) < 2.8:
+            return "AI hard block: micro recovery expected upside is too small."
+        if features.get("rsi", 0.0) > 60.0:
+            return "AI hard block: micro recovery RSI is too hot."
+    if "trend breakout setup" in reason:
+        if features.get("momentum_3_pct", 0.0) < 0.45 and features.get("expected_upside_pct", 0.0) < 2.4:
+            return "AI hard block: trend breakout short impulse is weak."
+        if features.get("rsi", 0.0) > 64.0 and features.get("expected_upside_pct", 0.0) < 2.5:
+            return "AI hard block: trend breakout RSI is hot without enough upside."
+    if "chart ai setup" in reason and features.get("close_position", 0.0) < 0.72:
+        return "AI hard block: chart setup close position is weak."
+    return ""
 
 
 def try_openai_review(decision_input: dict[str, Any], ai_config: AiDecisionConfig) -> tuple[DecisionReview | None, str | None]:
