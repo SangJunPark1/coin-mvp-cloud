@@ -114,11 +114,11 @@ class MovingAverageStrategy:
             return None
         if latest_price < short_ma * 0.997:
             return None
-        if pullback_depth_pct < 0.12 or reclaim_pct < max(1.0, self.config.min_validated_recovery_pct):
+        if pullback_depth_pct < 0.12 or reclaim_pct < max(1.35, self.config.min_validated_recovery_pct):
             return None
-        if volume_ratio < self.config.min_volume_ratio:
+        if volume_ratio < max(2.5, self.config.min_volume_ratio):
             return None
-        if expected_upside_pct < self.config.min_expected_upside_pct:
+        if expected_upside_pct < max(2.7, self.config.min_expected_upside_pct):
             return None
         if rsi is not None and rsi > self.config.max_entry_rsi:
             return None
@@ -280,8 +280,9 @@ class MovingAverageStrategy:
             distance_from_low <= 2.8
             and momentum_3 >= 0.25
             and momentum_8 >= 0.20
-            and volume_ratio >= max(1.35, self.config.min_volume_ratio)
+            and volume_ratio >= max(1.8, self.config.min_volume_ratio)
             and close_position >= 0.55
+            and recent_high_gap <= 0.55
             and 36.0 <= rsi <= 58.0
             and latest_price >= short_ma * 0.992
             and expected_upside_pct >= 1.8
@@ -300,6 +301,19 @@ class MovingAverageStrategy:
         ):
             setup = "volatility expansion"
             base_confidence = 0.56
+        elif (
+            distance_from_low <= 1.8
+            and range_expansion >= 1.35
+            and volume_ratio >= max(2.4, self.config.min_volume_ratio * 1.8)
+            and momentum_3 >= 0.18
+            and momentum_8 >= -0.65
+            and close_position >= 0.72
+            and 24.0 <= rsi <= 48.0
+            and expected_upside_pct >= 1.9
+            and latest_price >= short_ma * 0.988
+        ):
+            setup = "capitulation rebound"
+            base_confidence = 0.57
         elif (
             ema9_gap >= -0.10
             and ema21_gap >= -0.20
@@ -460,9 +474,13 @@ def bollinger_lower_rebound_quality(
             break
 
     recovering = latest >= previous
+    distance_pct = ((latest / lower) - 1.0) * 100.0 if lower > 0 else 0.0
+    middle_gap_pct = ((middle / latest) - 1.0) * 100.0 if latest > 0 else 0.0
+    if distance_pct > max(5.0, touch_tolerance_pct * 3.0):
+        return False, f"bollinger filter blocked: rebound already away from lower band {distance_pct:.2f}%"
+    if middle_gap_pct <= 0.4:
+        return False, f"bollinger filter blocked: weak middle-band upside {middle_gap_pct:.2f}%"
     if (near_lower or previous_touched) and prior_touched and recovering:
-        distance_pct = ((latest / lower) - 1.0) * 100.0 if lower > 0 else 0.0
-        middle_gap_pct = ((middle / latest) - 1.0) * 100.0 if latest > 0 else 0.0
         return True, f"bollinger lower rebound: distance {distance_pct:.2f}%; middle gap {middle_gap_pct:.2f}%"
     reasons = []
     if not (near_lower or previous_touched):

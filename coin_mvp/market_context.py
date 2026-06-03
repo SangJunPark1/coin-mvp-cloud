@@ -9,7 +9,7 @@ from typing import Any
 from .config import StrategyConfig
 from .data import UpbitPublicDataSource
 from .models import Candle
-from .news import fetch_crypto_news_signal
+from .news import fetch_community_signal, fetch_crypto_news_signal
 from .strategy import recent_volatility_pct
 
 KST = timezone(timedelta(hours=9))
@@ -37,6 +37,10 @@ class DecisionContext:
     news_risk_headline_count: int = 0
     news_positive_headline_count: int = 0
     news_headlines: list[str] | None = None
+    community_sentiment_score: float | None = None
+    community_risk_count: int = 0
+    community_positive_count: int = 0
+    community_headlines: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,6 +55,7 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
     global_change, btc_dominance = fetch_coingecko_global()
     binance_change, binance_quote_volume = fetch_binance_btcusdt_24h()
     news_signal = fetch_news_signal()
+    community_signal = fetch_local_community_signal()
     session_label, session_bias = current_session_label()
 
     allows = True
@@ -102,10 +107,19 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
             reasons.append("news risk elevated")
         elif news_signal.sentiment_score > 0.15:
             mode_score += 0.35
+    if community_signal is not None:
+        reasons.append(
+            f"community sentiment {community_signal.sentiment_score:.2f} "
+            f"({community_signal.positive_headline_count}+/{community_signal.risk_headline_count}-)"
+        )
+        if community_signal.risk_headline_count >= 5 and community_signal.sentiment_score < -0.20:
+            mode_score -= 0.55
+            reasons.append("community panic elevated")
+        elif community_signal.sentiment_score > 0.18:
+            mode_score += 0.45
+            reasons.append("community attention positive")
 
     market_mode, mode_multiplier, position_multiplier = classify_market_mode(mode_score, btc_momentum, global_change, binance_change)
-    if market_mode == "capital_protect":
-        allows = False
     reasons.append(f"session {session_label}")
     reasons.append(f"mode {market_mode} score {mode_score:.2f}")
 
@@ -130,12 +144,23 @@ def collect_decision_context(data_source: UpbitPublicDataSource, config: Strateg
         news_risk_headline_count=news_signal.risk_headline_count if news_signal is not None else 0,
         news_positive_headline_count=news_signal.positive_headline_count if news_signal is not None else 0,
         news_headlines=news_signal.latest_headlines if news_signal is not None else None,
+        community_sentiment_score=community_signal.sentiment_score if community_signal is not None else None,
+        community_risk_count=community_signal.risk_headline_count if community_signal is not None else 0,
+        community_positive_count=community_signal.positive_headline_count if community_signal is not None else 0,
+        community_headlines=community_signal.latest_headlines if community_signal is not None else None,
     )
 
 
 def fetch_news_signal():
     try:
         return fetch_crypto_news_signal(timeout_seconds=3, max_items=10)
+    except Exception:
+        return None
+
+
+def fetch_local_community_signal():
+    try:
+        return fetch_community_signal(timeout_seconds=3, max_items=16)
     except Exception:
         return None
 
@@ -165,7 +190,7 @@ def classify_market_mode(
     severe_global = global_change_pct is not None and global_change_pct <= -3.0
     severe_btc = binance_change_pct is not None and binance_change_pct <= -2.5
     if score <= -2.2 and (btc_momentum_pct < -0.35 or severe_global or severe_btc):
-        return "capital_protect", 0.0, 0.0
+        return "panic_rebound", 0.74, 0.55
     if score >= 2.0:
         return "risk_on", 1.18, 1.15
     if score >= -0.4:

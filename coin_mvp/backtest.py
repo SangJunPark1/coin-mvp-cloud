@@ -91,6 +91,7 @@ def main() -> None:
     parser.add_argument("--source", choices=["sample", "upbit"], default="sample")
     parser.add_argument("--top-markets", type=int, default=8)
     parser.add_argument("--ticks", type=int, default=60)
+    parser.add_argument("--step-minutes", type=int, default=1)
     parser.add_argument("--history-count", type=int, default=200)
     parser.add_argument("--output", default="reports/backtest_latest.html")
     parser.add_argument("--summary-output", default="reports/backtest_latest.json")
@@ -102,6 +103,7 @@ def main() -> None:
         source=args.source,
         top_markets=args.top_markets,
         ticks=args.ticks,
+        step_minutes=args.step_minutes,
         history_count=args.history_count,
         output=Path(args.output),
         summary_output=Path(args.summary_output),
@@ -115,6 +117,7 @@ def run_backtest(
     source: str = "sample",
     top_markets: int = 8,
     ticks: int = 60,
+    step_minutes: int = 1,
     history_count: int = 200,
     output: Path = Path("reports/backtest_latest.html"),
     summary_output: Path = Path("reports/backtest_latest.json"),
@@ -130,7 +133,8 @@ def run_backtest(
     original_context = watch_multi_module.collect_decision_context
     watch_multi_module.collect_decision_context = lambda _data_source, _strategy: static_backtest_context()
     try:
-        last_index = min(history_count - 1, warmup + max(1, ticks))
+        step = max(1, step_minutes)
+        last_index = min(history_count - 1, warmup + max(1, ticks) * step)
         completed = 0
         app.journal.event(
             "backtest_started",
@@ -139,12 +143,13 @@ def run_backtest(
                 "markets": markets,
                 "history_count": history_count,
                 "warmup": warmup,
+                "step_minutes": step,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             },
         )
-        for index in range(warmup, last_index):
+        for index in range(warmup, last_index, step):
             replay.set_index(index)
-            app.run_tick(index - warmup + 1)
+            app.run_tick(completed + 1)
             completed += 1
         app.journal.event(
             "backtest_finished",

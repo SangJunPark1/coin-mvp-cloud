@@ -63,7 +63,7 @@
     "bollinger_touch_tolerance_pct": 0.8,
     "bollinger_prior_touch_lookback": 2,
     "bollinger_filter_penalty": 0.04,
-    "bollinger_min_confirmations": 1,
+    "bollinger_min_confirmations": 2,
     "bollinger_min_expected_upside_pct": 1.5,
     "enable_crash_candle_filter": true,
     "crash_candle_lookback": 3,

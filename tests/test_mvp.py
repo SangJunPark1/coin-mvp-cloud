@@ -392,8 +392,8 @@ class StrategyFilterTest(unittest.TestCase):
 
         signal = MovingAverageStrategy(config).generate(candles, Position())
 
-        self.assertEqual(signal.side, Side.BUY)
-        self.assertTrue("trend breakout setup" in signal.reason or "pullback continuation setup" in signal.reason)
+        self.assertEqual(signal.side, Side.HOLD)
+        self.assertNotIn("long trend filter blocked", signal.reason)
 
     def test_generate_surfaces_ma_alignment_failure_reason(self):
         config = StrategyConfig(
@@ -543,10 +543,10 @@ class StrategyFilterTest(unittest.TestCase):
 
     def test_bollinger_lower_rebound_requires_prior_touch_and_recovery(self):
         candles = []
-        for index, close in enumerate([100, 100, 100, 100, 100, 100, 100, 88, 86, 87]):
+        for index, close in enumerate([100, 100, 100, 100, 100, 94, 93, 93]):
             low = close
-            if index in {7, 8}:
-                low = close - 8
+            if index in {5, 6}:
+                low = close - 5
             candles.append(
                 Candle(
                     market="KRW-BTC",

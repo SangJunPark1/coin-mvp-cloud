@@ -205,12 +205,30 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
         required += 0.04
     if "chart ai setup" in reason:
         required += 0.03
+    if "capitulation rebound" in reason:
+        required = min(required, 0.70 if mode in {"panic_rebound", "risk_off"} else 0.76)
     return min(required, 0.9)
 
 
 def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str, float]) -> str:
     reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
     mode = str(decision_input.get("market_context", {}).get("market_mode", "neutral")).lower()
+    if "capitulation rebound" in reason:
+        if mode not in {"panic_rebound", "risk_off", "neutral"}:
+            return "AI hard block: capitulation rebound is for weak-market regimes only."
+        if features.get("reward_risk_ratio", 0.0) < 2.2:
+            return "AI hard block: capitulation rebound reward/risk is too weak."
+        if features.get("volume_ratio", 0.0) < 2.4:
+            return "AI hard block: capitulation rebound volume is too thin."
+        if features.get("close_position", 0.0) < 0.72:
+            return "AI hard block: capitulation rebound close position is weak."
+        if features.get("momentum_3_pct", 0.0) < 0.18:
+            return "AI hard block: capitulation rebound bounce is too weak."
+        if not 24.0 <= features.get("rsi", 0.0) <= 50.0:
+            return "AI hard block: capitulation rebound RSI is outside the panic-rebound zone."
+        if features.get("community_sentiment_score", 0.0) < -0.45 and features.get("community_risk_count", 0.0) >= 6:
+            return "AI hard block: community panic is still too negative for a rebound."
+        return ""
     if features.get("reward_risk_ratio", 0.0) < 2.15:
         return "AI hard block: reward/risk ratio is below 2.15."
     if features.get("impulse_quality_score", 0.0) < 0.58:
@@ -227,9 +245,21 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
         if features.get("rsi", 0.0) > 60.0:
             return "AI hard block: micro recovery RSI is too hot."
     if "trend breakout setup" in reason:
+        if mode != "risk_on" and features.get("expected_upside_pct", 0.0) < 2.9:
+            return "AI hard block: neutral/risk-off trend breakout needs at least 2.9% expected upside."
+        if mode != "risk_on" and features.get("volume_ratio", 0.0) < 1.55:
+            return "AI hard block: neutral/risk-off trend breakout volume is not decisive enough."
+        if mode != "risk_on" and features.get("volume_ratio", 0.0) > 3.5 and features.get("rsi", 0.0) > 64.0:
+            return "AI hard block: neutral/risk-off trend breakout is too crowded."
+        if features.get("volume_ratio", 0.0) > 5.0 and features.get("rsi", 0.0) > 61.5:
+            return "AI hard block: trend breakout looks like late blow-off volume."
+        if features.get("rsi", 0.0) > 64.0 and features.get("volume_ratio", 0.0) < 2.0:
+            return "AI hard block: trend breakout RSI is hot without decisive volume."
         if features.get("momentum_3_pct", 0.0) < 0.45 and features.get("expected_upside_pct", 0.0) < 2.4:
             return "AI hard block: trend breakout short impulse is weak."
-        if features.get("rsi", 0.0) > 64.0 and features.get("expected_upside_pct", 0.0) < 2.5:
+        if features.get("rsi", 0.0) > 66.0:
+            return "AI hard block: trend breakout RSI is too hot."
+        if features.get("rsi", 0.0) > 64.0 and features.get("expected_upside_pct", 0.0) < 2.8:
             return "AI hard block: trend breakout RSI is hot without enough upside."
     if "chart ai setup" in reason and features.get("close_position", 0.0) < 0.72:
         return "AI hard block: chart setup close position is weak."

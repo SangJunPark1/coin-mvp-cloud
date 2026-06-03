@@ -116,8 +116,9 @@ def run_cloud_ticks(
                 "storage": "remote" if storage.enabled else "local",
             }
 
+    effective_top_markets = min(max(1, top_markets), 12)
     data_source = UpbitPublicDataSource()
-    markets = data_source.get_top_krw_markets(top_markets, min_trade_price_krw=config.strategy.min_price_krw)
+    markets = data_source.get_top_krw_markets(effective_top_markets, min_trade_price_krw=config.strategy.min_price_krw)
     app = MultiMarketTradingApp(config, data_source, markets, request_delay=request_delay)
     if state:
         apply_state(app, state)
@@ -128,6 +129,8 @@ def run_cloud_ticks(
                 "started_at": datetime.now(KST).isoformat(timespec="seconds"),
                 "starting_cash": config.starting_cash,
                 "markets": markets,
+                "requested_top_markets": top_markets,
+                "effective_top_markets": effective_top_markets,
                 "mode": "one_tick_cron",
             },
         )

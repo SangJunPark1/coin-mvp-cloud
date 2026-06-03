@@ -28,9 +28,7 @@ class UpbitPublicDataSource:
 
     def get_recent_candles(self, market: str, count: int, unit_minutes: int | None = None) -> list[Candle]:
         unit = unit_minutes or self.unit_minutes
-        params = urllib.parse.urlencode({"market": market, "count": count})
-        url = f"https://api.upbit.com/v1/candles/minutes/{unit}?{params}"
-        payload = self._read_json(url)
+        payload = self._read_candles(market, count, unit)
 
         candles = []
         for row in payload:
@@ -47,6 +45,29 @@ class UpbitPublicDataSource:
                 )
             )
         return list(reversed(candles))
+
+    def _read_candles(self, market: str, count: int, unit: int) -> list[dict]:
+        remaining = max(1, count)
+        rows: list[dict] = []
+        to: str | None = None
+        while remaining > 0:
+            page_count = min(200, remaining)
+            params = {"market": market, "count": page_count}
+            if to is not None:
+                params["to"] = to
+            url = f"https://api.upbit.com/v1/candles/minutes/{unit}?{urllib.parse.urlencode(params)}"
+            page = self._read_json(url)
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < page_count:
+                break
+            oldest_utc = datetime.fromisoformat(page[-1]["candle_date_time_utc"]).replace(tzinfo=timezone.utc)
+            to = oldest_utc.isoformat(timespec="seconds").replace("+00:00", "Z")
+            remaining -= len(page)
+            if remaining > 0:
+                time.sleep(0.12)
+        return rows[:count]
 
     def get_orderbook_snapshot(self, market: str) -> OrderbookSnapshot:
         params = urllib.parse.urlencode({"markets": market})

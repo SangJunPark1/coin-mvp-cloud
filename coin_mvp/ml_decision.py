@@ -33,10 +33,12 @@ def score_entry_with_feature_model(decision_input: dict[str, Any]) -> ModelScore
     logit += features["recent_volatility_pct"] * 0.10
     logit += features["btc_momentum_pct"] * 0.35
     logit += features["news_sentiment_score"] * 0.45
+    logit += features["community_sentiment_score"] * 0.35
     logit += features["chart_quality_score"] * 0.35
     logit += features["impulse_quality_score"] * 0.95
     logit += features["opportunity_edge_score"] * 0.70
     logit -= min(features["news_risk_headline_count"], 5.0) * 0.08
+    logit -= min(features["community_risk_count"], 6.0) * 0.045
     reason = str(decision_input.get("candidate", {}).get("signal_reason", ""))
     logit += setup_bias(reason)
     logit += setup_quality_adjustment(reason, features)
@@ -46,6 +48,10 @@ def score_entry_with_feature_model(decision_input: dict[str, Any]) -> ModelScore
     notes = []
     if features["news_risk_headline_count"] >= 3 and features["news_sentiment_score"] < 0:
         notes.append("News model detected elevated headline risk.")
+    if features["community_risk_count"] >= 5 and features["community_sentiment_score"] < 0:
+        notes.append("Community model detected panic-heavy retail sentiment.")
+    if features["community_sentiment_score"] > 0.2:
+        notes.append("Community attention model detected positive retail momentum.")
     if features["expected_downside_pct"] >= features["expected_upside_pct"]:
         notes.append("Feature model sees poor upside/downside balance.")
     if features["impulse_quality_score"] < 0.58:
@@ -98,6 +104,8 @@ def extract_features(decision_input: dict[str, Any]) -> dict[str, float]:
         "btc_momentum_pct": as_float(context.get("btc_momentum_pct")),
         "news_sentiment_score": as_float(context.get("news_sentiment_score")),
         "news_risk_headline_count": as_float(context.get("news_risk_headline_count")),
+        "community_sentiment_score": as_float(context.get("community_sentiment_score")),
+        "community_risk_count": as_float(context.get("community_risk_count")),
         "chart_quality_score": as_float(candidate.get("chart_quality_score")),
         "reward_risk_ratio": reward_risk,
         "momentum_3_pct": momentum_3,
