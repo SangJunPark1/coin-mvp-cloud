@@ -184,10 +184,13 @@ class MultiMarketTradingApp:
                 self.risk.record_fill(fill)
                 self.journal.trade(fill)
                 self.journal.event("fill", {"tick": tick, "fill": fill, "risk": self.risk.state})
-                if fill.realized_pnl < 0:
-                    self._register_stopout(market, tick)
-                    self.market_reentry_until_tick[market] = tick + self.config.strategy.reentry_cooldown_ticks
                 if not self.broker.get_position(market).is_open:
+                    cooldown = self.config.strategy.reentry_cooldown_ticks
+                    if fill.realized_pnl < 0:
+                        self._register_stopout(market, tick)
+                        self.market_reentry_until_tick[market] = tick + cooldown
+                    elif fill.realized_pnl > 0:
+                        self.market_reentry_until_tick[market] = tick + max(1, cooldown)
                     self.position_entry_tick.pop(market, None)
                     self.position_entry_strategy.pop(market, None)
 
@@ -727,6 +730,14 @@ class MultiMarketTradingApp:
             return 1.0
         edge = score - self.config.risk.min_candidate_score
         reason = signal.reason.lower()
+        if "composite engine setup: qullamaggie ucl breakout" in reason:
+            if signal.confidence >= 0.72 and edge >= 0.08:
+                return 1.22
+            return 1.08
+        if "composite engine setup: lcl recovery rebound" in reason:
+            if signal.confidence >= 0.68 and edge >= 0.06:
+                return 1.12
+            return 0.98
         if "chart ai setup: pullback reclaim" in reason:
             return 0.82
         if "chart ai setup" in reason:
@@ -769,6 +780,8 @@ class MultiMarketTradingApp:
             return max(configured, 0.62)
         if "chart ai setup" in reason:
             return max(configured, 0.58)
+        if "composite engine setup" in reason:
+            return max(configured, 0.70)
         return configured
 
     def _entry_filter_penalty_for_signal(self, signal: Signal, filter_reason: str, filter_penalty: float) -> float:
@@ -1188,6 +1201,8 @@ class MultiMarketTradingApp:
             self.position_entry_strategy.pop(market, None)
 
     def _entry_strategy_name(self, signal: Signal) -> str:
+        if "composite engine setup" in signal.reason:
+            return "composite_engine"
         if "bollinger rebound setup" in signal.reason:
             return "bollinger_rebound"
         if "range rebound setup" in signal.reason:
@@ -1432,8 +1447,11 @@ def candidate_score(candles: list[Candle], signal: Signal, config: StrategyConfi
         chart_quality += min(max(chart["momentum_3_pct"], 0.0) / 100.0, 0.035)
         chart_quality += min(max(chart["volume_ratio"] - 0.8, 0.0) * 0.035, 0.045)
         chart_quality += min(max(chart["close_position"] - 0.45, 0.0) * 0.08, 0.04)
-        if "chart ai setup" in signal.reason.lower():
+        reason = signal.reason.lower()
+        if "chart ai setup" in reason:
             chart_quality += 0.04
+        if "composite engine setup" in reason:
+            chart_quality += 0.055
     opportunity_edge = opportunity_score_for_signal(candles, signal, config)
     return (
         signal.confidence
@@ -1497,6 +1515,8 @@ def orderbook_imbalance_penalty(imbalance_ratio: float, min_imbalance_ratio: flo
 
 def strategy_name_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "composite engine setup" in text:
+        return "composite_engine"
     if "bollinger rebound setup" in text:
         return "bollinger_rebound"
     if "range rebound setup" in text:
@@ -1512,6 +1532,12 @@ def strategy_name_from_reason(reason: str) -> str:
 
 def reason_bucket_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "composite engine setup: qullamaggie ucl breakout" in text:
+        return "composite_qullamaggie_ucl"
+    if "composite engine setup: lcl recovery rebound" in text:
+        return "composite_lcl_rebound"
+    if "composite engine setup" in text:
+        return "composite_other"
     if "chart ai setup: pullback reclaim" in text:
         return "chart_ai_pullback_reclaim"
     if "chart ai setup: momentum ignition" in text:

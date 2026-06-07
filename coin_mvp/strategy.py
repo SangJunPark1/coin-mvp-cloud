@@ -37,6 +37,9 @@ class MovingAverageStrategy:
                 return Signal(Side.SELL, "trend break", latest_price, 0.6)
             return Signal(Side.HOLD, "position open, no exit condition", latest_price, 0.2)
 
+        composite_signal = self._control_band_composite_signal(candles, short_ma, long_ma)
+        if composite_signal is not None:
+            return composite_signal
         trend_signal = self._trend_breakout_signal(candles, short_ma, long_ma)
         if trend_signal is not None:
             return trend_signal
@@ -95,6 +98,118 @@ class MovingAverageStrategy:
             return None
         return Signal(Side.BUY, reason, latest_price, confidence)
 
+    def _control_band_composite_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        features = chart_feature_snapshot(candles, self.config.rsi_period)
+        if not features:
+            return None
+        closes = [c.close for c in candles]
+        latest_price = closes[-1]
+        bands = control_limits(closes, window=20, stddev_multiplier=1.65)
+        prior_bands = control_limits(closes[:-1], window=20, stddev_multiplier=1.65)
+        if bands is None or prior_bands is None:
+            return None
+        ucl, center, lcl = bands
+        prev_ucl, prev_center, prev_lcl = prior_bands
+        previous_price = closes[-2]
+        recent = candles[-20:]
+        prior = candles[-21:-1]
+        recent_high = max(candle.high for candle in prior) if prior else max(candle.high for candle in recent)
+        recent_low = min(candle.low for candle in recent)
+        width_pct = ((ucl / lcl) - 1.0) * 100.0 if lcl > 0 else 0.0
+        recent_widths = [
+            control_band_width_pct(closes[:index], window=20, stddev_multiplier=1.65)
+            for index in range(max(21, len(closes) - 14), len(closes) + 1)
+        ]
+        recent_widths = [value for value in recent_widths if value is not None]
+        median_width = sorted(recent_widths)[len(recent_widths) // 2] if recent_widths else width_pct
+        contraction = width_pct <= max(1.8, median_width * 0.88)
+        expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
+        reward_budget_pct = estimate_expected_upside_pct(candles, self.config.target_upside_pct)
+        volume_ratio = features["volume_ratio"]
+        rsi = features["rsi"]
+        close_position = features["close_position"]
+        momentum_3 = features["momentum_3_pct"]
+        momentum_8 = features["momentum_8_pct"]
+        ema21_gap = features["ema21_gap_pct"]
+        range_expansion = features["range_expansion_ratio"]
+
+        ucl_break_pct = ((latest_price / prev_ucl) - 1.0) * 100.0 if prev_ucl > 0 else 0.0
+        breakout = (
+            latest_price > prev_ucl * 1.001
+            and latest_price >= recent_high * 0.998
+            and previous_price <= prev_ucl * 1.006
+            and volume_ratio >= max(2.2, self.config.min_volume_ratio * 1.6)
+            and close_position >= 0.78
+            and momentum_3 >= 0.45
+            and momentum_8 >= 1.75
+            and width_pct >= 1.75
+            and (ucl_break_pct >= 0.75 or momentum_3 >= 0.9)
+            and 38.0 <= rsi <= min(66.5, self.config.max_entry_rsi)
+            and expected_upside_pct >= max(2.4, self.config.min_expected_upside_pct)
+            and (short_ma >= long_ma * 0.998 or latest_price >= center)
+        )
+        if breakout:
+            confidence = min(
+                0.88,
+                0.56
+                + min(max(momentum_3, 0.0) / 4.0, 0.08)
+                + min(max(volume_ratio - 1.0, 0.0) / 5.0, 0.10)
+                + min(expected_upside_pct / 22.0, 0.09)
+                + (0.05 if contraction else 0.0)
+                + min(max(close_position - 0.55, 0.0) / 4.0, 0.04),
+            )
+            contraction_text = "yes" if contraction else "no"
+            return Signal(
+                Side.BUY,
+                (
+                    "composite engine setup: qullamaggie ucl breakout; "
+                    f"ucl break {ucl_break_pct:.2f}%; "
+                    f"contraction {contraction_text}; band width {width_pct:.2f}%; "
+                    f"momentum3 {momentum_3:.2f}%; momentum8 {momentum_8:.2f}%; "
+                    f"volume {volume_ratio:.2f}x; RSI {rsi:.1f}; close position {close_position:.2f}; "
+                    f"expected follow-through {expected_upside_pct:.2f}%"
+                ),
+                latest_price,
+                confidence,
+            )
+
+        lcl_touched = candles[-1].low <= lcl * 1.006 or candles[-2].low <= prev_lcl * 1.006
+        recaptured = latest_price > lcl * 1.012 and latest_price > previous_price
+        near_low = ((latest_price / recent_low) - 1.0) * 100.0 if recent_low > 0 else 999.0
+        lcl_rebound = (
+            lcl_touched
+            and recaptured
+            and near_low <= 2.2
+            and volume_ratio >= max(1.85, self.config.min_volume_ratio)
+            and close_position >= 0.58
+            and momentum_3 >= 0.90
+            and momentum_8 >= -0.85
+            and 24.0 <= rsi <= 55.0
+            and reward_budget_pct >= max(2.35, self.config.range_rebound_min_expected_upside_pct)
+            and (ema21_gap >= -1.2 or range_expansion >= 1.18)
+        )
+        if lcl_rebound:
+            confidence = min(
+                0.82,
+                0.53
+                + min(max(momentum_3, 0.0) / 3.0, 0.06)
+                + min(max(volume_ratio - 1.0, 0.0) / 5.0, 0.08)
+                + min(reward_budget_pct / 22.0, 0.08)
+                + min(max(close_position - 0.52, 0.0) / 5.0, 0.04),
+            )
+            return Signal(
+                Side.BUY,
+                (
+                    "composite engine setup: lcl recovery rebound; "
+                    f"near low {near_low:.2f}%; lcl reclaim {(latest_price / lcl - 1.0) * 100.0:.2f}%; "
+                    f"band width {width_pct:.2f}%; momentum3 {momentum_3:.2f}%; volume {volume_ratio:.2f}x; "
+                    f"RSI {rsi:.1f}; close position {close_position:.2f}; expected upside {reward_budget_pct:.2f}%"
+                ),
+                latest_price,
+                confidence,
+            )
+        return None
+
     def _pullback_continuation_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
         closes = [c.close for c in candles]
         latest_price = closes[-1]
@@ -120,7 +235,7 @@ class MovingAverageStrategy:
             return None
         if expected_upside_pct < max(2.7, self.config.min_expected_upside_pct):
             return None
-        if rsi is not None and rsi > self.config.max_entry_rsi:
+        if rsi is not None and rsi > min(self.config.max_entry_rsi, 60.0):
             return None
         confidence = min(
             0.82,
@@ -156,7 +271,7 @@ class MovingAverageStrategy:
         close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
         trend_strength = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma else 0.0
 
-        if recent_momentum_pct < self.config.min_recent_momentum_pct:
+        if recent_momentum_pct < max(0.65, self.config.min_recent_momentum_pct):
             return False, f"weak recent momentum: {recent_momentum_pct:.2f}%", 0.2
         if trend_strength < max(0.10, self.config.min_recent_momentum_pct * 0.8):
             return False, f"weak trend slope: {trend_strength:.2f}%", 0.2
@@ -178,9 +293,9 @@ class MovingAverageStrategy:
         ema_text = ""
         if long_trend_ema is not None:
             ema_gap_pct = ((latest_price / long_trend_ema) - 1.0) * 100.0 if long_trend_ema > 0 else 0.0
-            if ema_gap_pct < -1.8:
+            if ema_gap_pct < -0.8:
                 return False, f"long trend filter blocked: price deeply below EMA{self.config.long_trend_ema_window}", 0.2
-            if ema_gap_pct < 0 and rsi is not None and rsi > 68.0:
+            if ema_gap_pct < 0 and rsi is not None and rsi > 60.0:
                 return False, f"long trend filter blocked: below EMA{self.config.long_trend_ema_window} with RSI {rsi:.1f}", 0.2
             if ema_gap_pct < 0:
                 ema_penalty = min(0.08, abs(ema_gap_pct) / 30.0)
@@ -266,13 +381,13 @@ class MovingAverageStrategy:
         if (
             ema9_gap >= -0.18
             and ema21_gap >= -0.35
-            and momentum_3 >= 0.22
+            and momentum_3 >= 0.45
             and momentum_8 >= 0.55
-            and volume_ratio >= max(1.5, self.config.min_volume_ratio)
+            and volume_ratio >= max(2.0, self.config.min_volume_ratio)
             and recent_high_gap <= 0.50
             and close_position >= 0.75
             and rsi <= 64.0
-            and expected_upside_pct >= 2.2
+            and expected_upside_pct >= 2.6
         ):
             setup = "momentum ignition"
             base_confidence = 0.58
@@ -285,19 +400,19 @@ class MovingAverageStrategy:
             and recent_high_gap <= 0.55
             and 36.0 <= rsi <= 58.0
             and latest_price >= short_ma * 0.992
-            and expected_upside_pct >= 1.8
+            and expected_upside_pct >= 2.6
         ):
             setup = "pullback reclaim"
             base_confidence = 0.55
         elif (
             range_expansion >= 1.15
             and volume_ratio >= max(2.0, self.config.min_volume_ratio * 1.5)
-            and momentum_3 >= 0.35
-            and momentum_8 >= 0.35
+            and momentum_3 >= 0.50
+            and momentum_8 >= 0.80
             and recent_high_gap <= 0.85
             and close_position >= 0.62
             and rsi <= 66.0
-            and expected_upside_pct >= 2.0
+            and expected_upside_pct >= 2.8
         ):
             setup = "volatility expansion"
             base_confidence = 0.56
@@ -431,6 +546,25 @@ def bollinger_bands(closes: list[float], window: int, stddev_multiplier: float) 
     middle = mean(recent)
     width = sample_stddev(recent) * stddev_multiplier
     return middle + width, middle, middle - width
+
+
+def control_limits(closes: list[float], window: int = 20, stddev_multiplier: float = 1.65) -> tuple[float, float, float] | None:
+    if window <= 1 or len(closes) < window:
+        return None
+    recent = closes[-window:]
+    center = mean(recent)
+    width = sample_stddev(recent) * stddev_multiplier
+    return center + width, center, max(0.0, center - width)
+
+
+def control_band_width_pct(closes: list[float], window: int = 20, stddev_multiplier: float = 1.65) -> float | None:
+    limits = control_limits(closes, window, stddev_multiplier)
+    if limits is None:
+        return None
+    ucl, center, lcl = limits
+    if center <= 0 or lcl <= 0:
+        return None
+    return ((ucl / lcl) - 1.0) * 100.0
 
 
 def bollinger_lower_rebound_quality(
@@ -613,7 +747,14 @@ def estimate_trend_follow_through_pct(candles: list[Candle], target_upside_pct: 
 
 def estimate_signal_expected_upside_pct(candles: list[Candle], signal: Signal, config: StrategyConfig) -> float:
     reason = signal.reason.lower()
-    if "trend breakout setup" in reason or "pullback continuation setup" in reason or "micro recovery setup" in reason or "chart ai setup" in reason:
+    if (
+        "trend breakout setup" in reason
+        or "pullback continuation setup" in reason
+        or "micro recovery setup" in reason
+        or "chart ai setup" in reason
+        or "qu llamaggie ucl breakout" in reason
+        or "qullamaggie ucl breakout" in reason
+    ):
         return estimate_trend_follow_through_pct(candles, config.target_upside_pct)
     return estimate_expected_upside_pct(candles, config.target_upside_pct)
 

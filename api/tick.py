@@ -28,7 +28,7 @@ class handler(BaseHTTPRequestHandler):
             resume_only = query.get("resume_only", [""])[0].lower() in {"1", "true", "yes"}
             result = run_cloud_ticks(
                 config_path=os.environ.get("COIN_MVP_CONFIG", "config.cloud.json"),
-                top_markets=int(os.environ.get("TOP_MARKETS", "12")),
+                top_markets=int(os.environ.get("TOP_MARKETS", "20")),
                 request_delay=float(os.environ.get("REQUEST_DELAY", "0.10")),
                 ticks=0 if reset_only or resume_only else 1,
                 outputs=[Path(os.environ.get("REPORT_OUTPUT", "/tmp/coin_mvp/report.html"))],

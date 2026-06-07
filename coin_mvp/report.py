@@ -10,6 +10,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+REPORT_PARTIAL_TAKE_PROFIT_PCT = 1.0
+REPORT_TARGET_UPSIDE_PCT = 3.0
+REPORT_STOP_LOSS_PCT = 0.65
+REPORT_TRAILING_STOP_PCT = 0.5
+
 
 @dataclass(frozen=True)
 class TradeRow:
@@ -88,6 +93,137 @@ def read_events(path: Path) -> list[dict[str, Any]]:
 
 def render_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
     return render_console_report(trades, events)
+
+
+def render_compact_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
+    trades = sorted(trades, key=lambda trade: parse_sort_time(trade.timestamp))
+    events = sorted(events, key=lambda event: parse_sort_time(str(event.get("timestamp", ""))))
+    metrics = calculate_metrics(trades)
+    daily = calculate_daily_metrics(trades, events)
+    last_event = events[-1] if events else {}
+    last_payload = last_event.get("payload", {}) if isinstance(last_event, dict) else {}
+    risk = last_payload.get("risk", {}) if isinstance(last_payload, dict) else {}
+    portfolio = portfolio_summary(trades, events)
+    open_positions = find_latest_positions(events)
+    latest_context = find_latest_decision_context(events)
+    refreshed_at = display_time(str(last_event.get("timestamp", ""))) if last_event else "아직 없음"
+    market_mode = str(latest_context.get("market_mode", "unknown")) if latest_context else "unknown"
+    session_label = str(latest_context.get("session_label", "-")) if latest_context else "-"
+    change = float(portfolio["change_amount"])
+    change_class = "pos" if change >= 0 else "neg"
+    cash = float(portfolio.get("cash", portfolio["current_equity"]))
+    halted = bool(risk.get("halted"))
+    operation_state = "중지" if halted else "운영 중"
+    operation_class = "warn" if halted else "ok"
+    target_amount = float(portfolio["starting_cash"]) * 0.03
+    target_progress = change / target_amount if target_amount else 0.0
+    cards = [
+        ("평가금액", krw(float(portfolio["current_equity"]))),
+        ("손익", krw(change)),
+        ("수익률", pct(float(portfolio["return_pct"]) / 100.0)),
+        ("오늘 손익", krw(float(daily["change_amount"]))),
+        ("오늘 수익률", pct(float(daily["return_pct"]) / 100.0)),
+        ("오늘 목표", pct(float(daily["target_progress"]))),
+        ("가용 현금", krw(cash)),
+        ("완료 거래", str(metrics["exit_count"])),
+        ("승률", pct(float(metrics["win_rate"]))),
+        ("기대값", krw(float(metrics["expectancy"]))),
+        ("오픈", f"{len(open_positions)}개"),
+    ]
+    state_rows = [
+        ("상태", operation_state, operation_class),
+        ("시장", market_mode, "warn" if market_mode in {"risk_off", "capital_protect"} else "ok" if market_mode == "risk_on" else ""),
+        ("세션", session_label, ""),
+        ("오늘 진입", str(risk.get("entries_today", 0)), ""),
+        ("연속 손실", str(risk.get("consecutive_losses", 0)), "warn" if int(risk.get("consecutive_losses", 0) or 0) else ""),
+        ("일 목표 진행률", pct(float(daily["target_progress"])), "pos" if float(daily["target_progress"]) >= 0 else "neg"),
+    ]
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>코인 자동매매 리포트</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#0b0f16; --panel:#111722; --panel2:#171f2c; --line:#263244; --soft:#1c2635; --ink:#edf4ff; --muted:#8fa0ba; --green:#00d4a6; --red:#ff4d6d; --blue:#5b8cff; --amber:#f7b955; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--ink); font:13px/1.45 "Segoe UI","Malgun Gothic",Arial,sans-serif; }}
+    header {{ position:sticky; top:0; z-index:5; display:flex; align-items:center; justify-content:space-between; gap:16px; min-height:52px; padding:0 16px; background:#171d29; border-bottom:1px solid #313b4d; }}
+    h1 {{ margin:0; font-size:16px; }}
+    h2 {{ margin:0; padding:11px 12px; font-size:14px; border-bottom:1px solid var(--line); }}
+    .brand {{ display:flex; align-items:center; gap:10px; min-width:0; }}
+    .mark {{ width:22px; height:22px; border-radius:50%; background:#b42318; display:grid; place-items:center; font-weight:900; }}
+    .top {{ display:flex; gap:16px; color:#c8d4e6; font-weight:800; white-space:nowrap; }}
+    main {{ padding:8px; }}
+    .hero {{ display:grid; grid-template-columns:minmax(260px,1.2fr) repeat(3,minmax(170px,.7fr)); gap:8px; margin-bottom:8px; }}
+    .hero-card,.card,section {{ background:var(--panel); border:1px solid var(--line); border-radius:6px; }}
+    .hero-card {{ padding:16px; min-height:96px; }}
+    .label {{ color:var(--muted); font-weight:700; font-size:12px; }}
+    .amount {{ margin-top:8px; font-size:30px; line-height:1.1; font-weight:900; overflow-wrap:anywhere; }}
+    .value {{ margin-top:7px; font-size:20px; font-weight:900; overflow-wrap:anywhere; }}
+    .note {{ margin-top:6px; color:var(--muted); font-size:12px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-bottom:8px; }}
+    .card {{ padding:11px 12px; min-height:64px; }}
+    .layout {{ display:grid; grid-template-columns:minmax(520px,1.3fr) minmax(320px,.7fr); gap:8px; align-items:start; }}
+    .split {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; margin-top:8px; }}
+    section {{ overflow:hidden; }}
+    .chart {{ padding:12px; }}
+    .chart-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; flex-wrap:wrap; }}
+    .chart-title {{ font-weight:900; }}
+    .muted {{ color:var(--muted); }}
+    .state {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }}
+    .state-item {{ padding:12px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); }}
+    .state-item:nth-child(2n) {{ border-right:0; }}
+    .state-value {{ margin-top:6px; font-weight:900; overflow-wrap:anywhere; }}
+    .table-wrap {{ overflow:auto; max-height:38vh; -webkit-overflow-scrolling:touch; }}
+    table {{ width:100%; min-width:720px; border-collapse:separate; border-spacing:0; }}
+    th,td {{ padding:8px 10px; border-bottom:1px solid var(--soft); vertical-align:top; background:var(--panel); white-space:nowrap; }}
+    th {{ position:sticky; top:0; z-index:2; color:var(--muted); background:var(--panel2); text-align:left; font-size:12px; }}
+    td.text {{ white-space:normal; min-width:260px; }}
+    td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+    .ops {{ max-height:310px; overflow:auto; font-family:Consolas,"Cascadia Mono",monospace; font-size:12px; background:#0e131c; }}
+    .ops-line {{ padding:4px 10px; border-bottom:1px solid #172033; color:#c9d5e8; }}
+    .time {{ color:var(--muted); }}
+    .event {{ color:var(--green); font-weight:800; }}
+    .pos,.ok {{ color:var(--green); font-weight:900; }}
+    .neg {{ color:var(--red); font-weight:900; }}
+    .warn {{ color:var(--amber); font-weight:900; }}
+    .buy {{ color:var(--blue); font-weight:900; }}
+    .sell {{ color:var(--red); font-weight:900; }}
+    .empty {{ padding:16px; color:var(--muted); }}
+    .equity-chart {{ display:block; width:100%; min-height:260px; max-height:390px; background:#0e131c; border:1px solid #222d3d; border-radius:4px; }}
+    @media (max-width:1000px) {{ header {{ position:static; display:block; padding:12px; }} .top {{ margin-top:10px; flex-wrap:wrap; white-space:normal; }} .hero,.layout,.split {{ grid-template-columns:1fr; }} .grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} }}
+    @media (max-width:560px) {{ main {{ padding:6px; }} .grid,.state {{ grid-template-columns:1fr; }} .amount {{ font-size:26px; }} table {{ min-width:640px; }} .equity-chart {{ min-height:220px; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="mark">↗</span><h1>코인 오토 트레이딩 시스템</h1></div>
+    <div class="top"><span>보유 KRW {html.escape(krw(cash))}</span><span>누적 수익률 <span class="{change_class}">{html.escape(pct(float(portfolio["return_pct"]) / 100.0))}</span></span></div>
+  </header>
+  <main>
+    <div class="hero">
+      <div class="hero-card"><div class="label">현재 평가금액</div><div class="amount">{html.escape(krw(float(portfolio["current_equity"])))}</div><div class="note">마지막 갱신 {html.escape(refreshed_at)}</div></div>
+      <div class="hero-card"><div class="label">시작 대비 손익</div><div class="value {change_class}">{html.escape(krw(change))}</div><div class="note">실현/미실현 합산</div></div>
+      <div class="hero-card"><div class="label">현재 수익률</div><div class="value {change_class}">{html.escape(pct(float(portfolio["return_pct"]) / 100.0))}</div><div class="note">100만원 기준</div></div>
+      <div class="hero-card"><div class="label">보유 상태</div><div class="value">{len(open_positions)}개 보유</div><div class="note">현금 {html.escape(krw(cash))}</div></div>
+    </div>
+    <div class="grid">{render_cards(cards)}</div>
+    <div class="layout">
+      <section class="chart"><div class="chart-head"><div><div class="chart-title">누적 수익률</div><div class="muted">핵심 성과만 표시합니다. 상세 리포트는 /api/report?full=1</div></div></div>{render_equity_chart(trades, events)}</section>
+      <section><h2>운영 상태</h2><div class="state">{''.join(render_state_item(label, value, klass) for label, value, klass in state_rows)}</div></section>
+    </div>
+    <div class="split">
+      <section><h2>오픈 포지션</h2>{render_open_positions(events)}</section>
+      <section><h2>실시간 판단 로그</h2>{render_compact_ops_log(events)}</section>
+    </div>
+    <div class="split">
+      <section><h2>최근 체결</h2>{render_compact_trade_table(trades)}</section>
+      <section><h2>핵심 진단</h2>{render_compact_diagnosis(metrics, market_mode)}</section>
+    </div>
+  </main>
+</body>
+</html>"""
 
 
 def render_console_report(trades: list[TradeRow], events: list[dict[str, Any]]) -> str:
@@ -839,6 +975,38 @@ def portfolio_summary(trades: list[TradeRow], events: list[dict[str, Any]]) -> d
     }
 
 
+def calculate_daily_metrics(trades: list[TradeRow], events: list[dict[str, Any]], target_pct: float = 3.0) -> dict[str, float]:
+    latest_equity = find_latest_equity(events)
+    daily_start = find_latest_daily_starting_equity(events)
+    if latest_equity is None:
+        latest_equity = (portfolio_summary(trades, events)["current_equity"] if events or trades else 1_000_000.0)  # type: ignore[index]
+    if daily_start is None or daily_start <= 0:
+        daily_start = find_starting_cash(events) or 1_000_000.0
+    change = float(latest_equity) - float(daily_start)
+    return_pct = (change / float(daily_start)) * 100.0 if daily_start else 0.0
+    return {
+        "starting_equity": float(daily_start),
+        "current_equity": float(latest_equity),
+        "change_amount": change,
+        "return_pct": return_pct,
+        "target_amount": float(daily_start) * (target_pct / 100.0),
+        "target_progress": return_pct / target_pct if target_pct else 0.0,
+    }
+
+
+def find_latest_daily_starting_equity(events: list[dict[str, Any]]) -> float | None:
+    for event in reversed(events):
+        payload = event.get("payload", {}) if isinstance(event, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        risk = payload.get("risk")
+        if isinstance(risk, dict):
+            value = to_float(risk.get("starting_equity"))
+            if value is not None:
+                return value
+    return None
+
+
 def render_portfolio_hero(portfolio: dict[str, float | str]) -> str:
     change = float(portfolio["change_amount"])
     change_class = "pos" if change > 0 else "neg" if change < 0 else ""
@@ -992,6 +1160,94 @@ def render_state_item(label: str, value: str, klass: str) -> str:
     return f'<div class="state-item"><div class="state-name">{html.escape(label)}</div><div{value_class}>{html.escape(value)}</div></div>'
 
 
+def render_compact_ops_log(events: list[dict[str, Any]], limit: int = 12) -> str:
+    lines: list[str] = []
+    for event in reversed(events):
+        name = str(event.get("event", ""))
+        if name not in {"tick", "trade", "state_snapshot", "forced_exit", "watch_error"}:
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        timestamp = display_time(str(event.get("timestamp", "")))
+        if name == "tick":
+            signal = payload.get("signal", {})
+            signal_reason = signal.get("reason", "") if isinstance(signal, dict) else ""
+            market = str(payload.get("market", "-"))
+            candidates = payload.get("candidate_count", 0)
+            equity = payload.get("equity", "")
+            text = f"{market} 후보 {candidates}개 · {short_reason(str(signal_reason), 96)}"
+            if equity != "":
+                text += f" · 평가 {krw(to_float(equity) or 0.0)}"
+        elif name == "trade":
+            fill = payload.get("fill", payload)
+            if isinstance(fill, dict):
+                side = "매수" if fill.get("side") == "buy" else "매도"
+                text = f"{fill.get('market', '-')} {side} · 손익 {krw(to_float(fill.get('realized_pnl')) or 0.0)}"
+            else:
+                text = "체결 기록"
+        elif name == "state_snapshot":
+            risk = payload.get("risk", {})
+            tick = payload.get("tick", "-")
+            halted = bool(risk.get("halted")) if isinstance(risk, dict) else False
+            text = f"상태 동기화 · tick {tick} · {'중지' if halted else '운영 중'}"
+        else:
+            text = short_reason(json.dumps(payload, ensure_ascii=False), 120)
+        lines.append(
+            f'<div class="ops-line"><span class="time">{html.escape(timestamp)}</span> '
+            f'<span class="event">{html.escape(korean_event(name))}</span> {html.escape(text)}</div>'
+        )
+        if len(lines) >= limit:
+            break
+    if not lines:
+        return '<div class="empty">아직 로그가 없습니다.</div>'
+    return '<div class="ops">' + "".join(lines) + "</div>"
+
+
+def render_compact_trade_table(trades: list[TradeRow], limit: int = 8) -> str:
+    recent = sorted(trades, key=lambda trade: parse_sort_time(trade.timestamp), reverse=True)[:limit]
+    if not recent:
+        return '<div class="empty">아직 거래 기록이 없습니다.</div>'
+    rows = []
+    for trade in recent:
+        side_class = "buy" if trade.side == "buy" else "sell"
+        pnl_class = "pos" if trade.realized_pnl > 0 else "neg" if trade.realized_pnl < 0 else ""
+        rows.append(
+            (
+                display_time(trade.timestamp),
+                trade.market,
+                f'<span class="{side_class}">{html.escape("매수" if trade.side == "buy" else "매도")}</span>',
+                f"{trade.price:,.4f}",
+                f'<span class="{pnl_class}">{html.escape(krw(trade.realized_pnl))}</span>',
+                short_reason(trade.reason, 90),
+            )
+        )
+    return render_simple_table(["시간", "마켓", "구분", "가격", "손익", "이유"], rows, raw_cols={2, 4}, text_cols={5}, num_cols={3, 4})
+
+
+def render_compact_diagnosis(metrics: dict[str, float | int], market_mode: str) -> str:
+    exit_count = int(metrics["exit_count"])
+    expectancy = float(metrics["expectancy"])
+    payoff = float(metrics["payoff_ratio"])
+    win_rate = float(metrics["win_rate"])
+    items = [
+        ("표본", f"{exit_count}건", "warn" if exit_count < 30 else "ok"),
+        ("기대값", krw(expectancy), "pos" if expectancy > 0 else "neg" if expectancy < 0 else ""),
+        ("손익비", ratio(payoff), "pos" if payoff >= 1.2 else "warn" if payoff >= 0.9 else "neg"),
+        ("승률", pct(win_rate), "pos" if win_rate >= 0.5 else "warn"),
+        ("시장 모드", market_mode, "warn" if market_mode in {"risk_off", "capital_protect"} else "ok" if market_mode == "risk_on" else ""),
+    ]
+    rows = [(label, f'<span class="{klass}">{html.escape(value)}</span>' if klass else html.escape(value)) for label, value, klass in items]
+    return render_simple_table(["항목", "값"], rows, raw_cols={1}, num_cols={1})
+
+
+def short_reason(reason: str, max_chars: int) -> str:
+    text = " ".join(str(reason).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+
 def render_open_positions(events: list[dict[str, Any]]) -> str:
     positions = find_latest_positions(events)
     if not positions:
@@ -1005,6 +1261,10 @@ def render_open_positions(events: list[dict[str, Any]]) -> str:
         mark_price = latest_prices.get(market, avg_price)
         value = qty * mark_price
         pnl_pct = (mark_price / avg_price - 1.0) if avg_price > 0 else 0.0
+        partial_take_price = avg_price * (1.0 + REPORT_PARTIAL_TAKE_PROFIT_PCT / 100.0)
+        target_price = avg_price * (1.0 + REPORT_TARGET_UPSIDE_PCT / 100.0)
+        stop_price = avg_price * (1.0 - REPORT_STOP_LOSS_PCT / 100.0)
+        trailing_price = peak_price * (1.0 - REPORT_TRAILING_STOP_PCT / 100.0) if peak_price > 0 else 0.0
         cls = "pos" if pnl_pct > 0 else "neg" if pnl_pct < 0 else ""
         rows.append(
             (
@@ -1015,13 +1275,17 @@ def render_open_positions(events: list[dict[str, Any]]) -> str:
                 krw(value),
                 f'<span class="{cls}">{html.escape(pct(pnl_pct))}</span>',
                 f"{peak_price:,.4f}",
+                f"{partial_take_price:,.4f}",
+                f"{target_price:,.4f}",
+                f"{stop_price:,.4f}",
+                f"{trailing_price:,.4f}",
             )
         )
     return render_simple_table(
-        ["마켓", "수량", "평균 단가", "현재가", "평가금액", "평가수익률", "고점"],
+        ["마켓", "수량", "평균 단가", "현재가", "평가금액", "평가수익률", "고점", "1차 익절가", "최종 목표가", "손절가", "트레일링가"],
         rows,
         raw_cols={5},
-        num_cols={1, 2, 3, 4, 5, 6},
+        num_cols={1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
     )
 
 

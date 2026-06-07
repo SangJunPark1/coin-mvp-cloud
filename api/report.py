@@ -5,10 +5,11 @@ import os
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from coin_mvp.cloud_storage import get_cloud_storage, runtime_config
 from coin_mvp.config import load_config
-from coin_mvp.report import read_events, read_trades, render_report
+from coin_mvp.report import read_events, read_trades, render_compact_report, render_report
 
 
 class handler(BaseHTTPRequestHandler):
@@ -21,7 +22,9 @@ class handler(BaseHTTPRequestHandler):
             trades = read_trades(config.paths.trade_journal)
             events = read_events(config.paths.event_log)
             events = append_state_snapshot(events, load_state(config.paths.state_file))
-            html = render_report(trades, events)
+            query = parse_qs(urlparse(self.path).query)
+            full = str(query.get("full", [""])[0]).lower() in {"1", "true", "yes"}
+            html = render_report(trades, events) if full else render_compact_report(trades, events)
             self._send_html(html)
         except Exception as exc:
             self._send_html(f"<pre>{repr(exc)}</pre>", status=500)

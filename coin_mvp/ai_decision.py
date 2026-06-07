@@ -199,6 +199,8 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
         required = 0.82
     elif mode == "risk_on":
         required = 0.62
+    if "composite engine setup" in reason:
+        required = min(required, 0.68 if mode in {"risk_on", "neutral"} else 0.74)
     if "range rebound setup" in reason:
         required += 0.06
     if "micro recovery setup" in reason:
@@ -228,6 +230,24 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
             return "AI hard block: capitulation rebound RSI is outside the panic-rebound zone."
         if features.get("community_sentiment_score", 0.0) < -0.45 and features.get("community_risk_count", 0.0) >= 6:
             return "AI hard block: community panic is still too negative for a rebound."
+        return ""
+    if "composite engine setup" in reason:
+        if features.get("reward_risk_ratio", 0.0) < 1.75:
+            return "AI hard block: composite engine reward/risk is too weak."
+        if features.get("volume_ratio", 0.0) < 1.25:
+            return "AI hard block: composite engine volume is too thin."
+        if features.get("close_position", 0.0) < 0.56:
+            return "AI hard block: composite engine close position is weak."
+        if "qullamaggie ucl breakout" in reason:
+            if features.get("momentum_3_pct", 0.0) < 0.12:
+                return "AI hard block: UCL breakout impulse is too weak."
+            if features.get("rsi", 0.0) > 69.0:
+                return "AI hard block: UCL breakout RSI is too hot."
+        if "lcl recovery rebound" in reason:
+            if not 22.0 <= features.get("rsi", 0.0) <= 58.0:
+                return "AI hard block: LCL rebound RSI is outside recovery range."
+            if features.get("momentum_3_pct", 0.0) < 0.02:
+                return "AI hard block: LCL rebound has not recovered yet."
         return ""
     if features.get("reward_risk_ratio", 0.0) < 2.15:
         return "AI hard block: reward/risk ratio is below 2.15."
