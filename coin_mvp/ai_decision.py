@@ -71,6 +71,8 @@ def review_entry_candidate(
         )
 
     confidence = min(0.95, max(0.0, signal.confidence + model_score.confidence_adjustment) * context.score_multiplier)
+    reason_text = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
+    is_daily_participation = "daily participation setup" in reason_text
     if expected_upside < strategy.min_expected_upside_pct:
         risk_notes.append("Expected upside is below the configured minimum.")
     if expected_downside >= expected_upside:
@@ -88,9 +90,12 @@ def review_entry_candidate(
     grade = decision_grade(confidence, expected_upside, expected_downside, context.allows_entries)
     hard_block = upgraded_model_hard_block(decision_input, model_score.features)
 
-    if not context.allows_entries:
+    if not context.allows_entries and not is_daily_participation:
         action = "pause"
         thesis = "Market context is unfavorable, so the candidate should not be opened."
+    elif is_daily_participation:
+        action = "buy"
+        thesis = "Daily participation engine chose the best tradable market, so the AI layer allows the entry instead of sitting in cash."
     elif expected_downside >= expected_upside:
         action = "hold"
         thesis = "Candidate risk/reward is unfavorable because downside is at least as large as upside."
@@ -207,6 +212,8 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
         required += 0.04
     if "chart ai setup" in reason:
         required += 0.03
+    if "daily participation setup" in reason:
+        required = min(required, 0.50 if mode != "capital_protect" else 0.9)
     if "capitulation rebound" in reason:
         required = min(required, 0.70 if mode in {"panic_rebound", "risk_off"} else 0.76)
     return min(required, 0.9)
@@ -215,6 +222,16 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
 def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str, float]) -> str:
     reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
     mode = str(decision_input.get("market_context", {}).get("market_mode", "neutral")).lower()
+    if "daily participation setup" in reason:
+        if mode == "capital_protect":
+            return "AI hard block: daily participation is blocked in capital-protect mode."
+        if features.get("volume_ratio", 0.0) < 0.08:
+            return "AI hard block: daily participation has almost no tradable volume."
+        if features.get("rsi", 0.0) >= 95.0:
+            return "AI hard block: daily participation is extremely overheated."
+        if features.get("momentum_8_pct", 0.0) < -4.0 and features.get("close_position", 0.0) < 0.18:
+            return "AI hard block: daily participation is in active breakdown."
+        return ""
     if "capitulation rebound" in reason:
         if mode not in {"panic_rebound", "risk_off", "neutral"}:
             return "AI hard block: capitulation rebound is for weak-market regimes only."

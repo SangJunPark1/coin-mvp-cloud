@@ -6,6 +6,7 @@ import time
 from dataclasses import asdict
 from datetime import timedelta, timezone
 from pathlib import Path
+from statistics import pstdev
 
 from .ai_decision import review_entry_candidate
 from .broker import PortfolioPaperBroker
@@ -226,8 +227,7 @@ class MultiMarketTradingApp:
                     "risk": self.risk.state,
                 },
             )
-            return
-        if not context.allows_entries:
+        if not context.allows_entries and str(getattr(context, "market_mode", "neutral")) == "capital_protect":
             self.journal.event(
                 "market_scan",
                 {
@@ -349,6 +349,31 @@ class MultiMarketTradingApp:
         if breadth_ratio < self.config.strategy.min_market_breadth_ratio:
             shortage = self.config.strategy.min_market_breadth_ratio - breadth_ratio
             breadth_penalty = min(0.35, shortage * 0.8)
+        if not candidates:
+            participation = self._daily_participation_candidate(tick, candles_by_market, context, breadth_penalty)
+            if participation is not None:
+                candidates.append(participation)
+                blocked_reasons["daily participation fallback activated"] = (
+                    blocked_reasons.get("daily participation fallback activated", 0) + 1
+                )
+            else:
+                self.journal.event(
+                    "market_scan",
+                    {
+                        "tick": tick,
+                        "markets_scanned": len(self.markets),
+                        "candidates": 0,
+                        "reason": "no entry condition" if breadth_penalty <= 0 else f"no entry condition; breadth penalty {breadth_penalty:.2f}",
+                        "decision_context": context.to_dict(),
+                        "blocked_reasons": blocked_reasons,
+                        "blocked_samples": blocked_samples,
+                        "market_breadth_ratio": breadth_ratio,
+                        "market_breadth_penalty": breadth_penalty,
+                        "risk": self.risk.state,
+                    },
+                )
+                return
+
         if not candidates:
             self.journal.event(
                 "market_scan",
@@ -485,6 +510,134 @@ class MultiMarketTradingApp:
                 },
             )
 
+    def _daily_participation_candidate(
+        self,
+        tick: int,
+        candles_by_market: dict[str, list[Candle]],
+        context,
+        breadth_penalty: float,
+    ) -> tuple[float, str, list[Candle], Signal] | None:
+        if self.risk.state.entries_today >= self.config.risk.max_entries_per_day:
+            return None
+        if self.broker.open_markets():
+            return None
+        mode = str(getattr(context, "market_mode", "neutral"))
+        if mode == "capital_protect":
+            return None
+
+        best: tuple[float, str, list[Candle], Signal] | None = None
+        for market, candles in candles_by_market.items():
+            if self.broker.get_position(market).is_open:
+                continue
+            if candles[-1].close < self.config.strategy.min_price_krw:
+                continue
+            crash_risk, _crash_reason = bearish_crash_candle_risk(candles, self.config.strategy)
+            if crash_risk:
+                continue
+            chart = chart_feature_snapshot(candles, self.config.strategy.rsi_period)
+            if not chart:
+                continue
+            try:
+                orderbook = self.data_source.get_orderbook_snapshot(market)
+            except Exception:
+                continue
+            spread_limit = self.config.strategy.max_orderbook_spread_bps
+            if orderbook.spread_bps > max(95.0, spread_limit * 6.0):
+                continue
+            expected_upside = estimate_signal_expected_upside_pct(
+                candles,
+                Signal(Side.BUY, "daily participation setup", candles[-1].close, 0.58),
+                self.config.strategy,
+            )
+            expected_downside = estimate_expected_downside_pct(
+                candles,
+                self.config.strategy.stop_loss_pct,
+                self.config.strategy.stop_volatility_multiplier,
+            )
+            if chart["volume_ratio"] < 0.12:
+                continue
+            if chart["momentum_8_pct"] < -2.6 and chart["close_position"] < 0.25:
+                continue
+            if chart["rsi"] >= 95.0:
+                continue
+            try:
+                rank_candles = self.data_source.get_recent_candles(market, 90, unit_minutes=15)
+            except Exception:
+                rank_candles = candles[-90:]
+            rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
+
+            confidence = 0.58
+            confidence += min(max(chart["momentum_3_pct"], 0.0) * 0.05, 0.05)
+            confidence += min(max(chart["volume_ratio"] - 0.5, 0.0) * 0.02, 0.05)
+            confidence += min(max(chart["close_position"] - 0.25, 0.0) * 0.08, 0.05)
+            confidence += min(max(rank_score, 0.0) * 0.08, 0.08)
+            if mode == "risk_on":
+                confidence += 0.04
+            elif mode == "risk_off":
+                confidence -= 0.01
+            confidence = min(0.74, max(0.56, confidence))
+            reason = (
+                "daily participation setup: hybrid rank active entry; "
+                f"{rank_reason}; "
+                f"momentum3 {chart['momentum_3_pct']:.2f}%; momentum8 {chart['momentum_8_pct']:.2f}%; "
+                f"volume {chart['volume_ratio']:.2f}x; RSI {chart['rsi']:.1f}; "
+                f"close position {chart['close_position']:.2f}; expected upside {expected_upside:.2f}%; "
+                f"spread {orderbook.spread_bps:.1f}bps"
+            )
+            signal = Signal(Side.BUY, reason, candles[-1].close, confidence)
+            score = candidate_score(candles, signal, self.config.strategy, penalty=breadth_penalty * 0.20)
+            score += max(rank_score, -0.12) * 0.42
+            score += min(max(chart["volume_ratio"], 0.0) * 0.012, 0.045)
+            score += min(max(chart["close_position"], 0.0) * 0.035, 0.035)
+            score -= min(max(orderbook.spread_bps - spread_limit, 0.0) / 1000.0, 0.04)
+            floor = self._candidate_score_floor(context, self.broker.equity(self.last_prices))
+            score = max(score, floor + 0.08)
+            if best is None or score > best[0]:
+                best = (score, market, candles, signal)
+        return best
+
+    def _hybrid_rank_score(self, candles: list[Candle]) -> tuple[float, str]:
+        if len(candles) < 30:
+            return 0.0, "hybrid rank unavailable"
+        closes = [candle.close for candle in candles]
+        latest = candles[-1]
+        previous = candles[-2]
+        momentum1 = percent_change(latest.close, previous.close)
+        momentum3 = percent_change(latest.close, closes[-4])
+        momentum8 = percent_change(latest.close, closes[-9])
+        volume_ratio = latest.volume / max(mean([candle.volume for candle in candles[-20:-1]]), 1e-9)
+        rsi = calculate_rsi(closes, self.config.strategy.rsi_period) or 50.0
+        high = max(candle.high for candle in candles[-20:])
+        low = min(candle.low for candle in candles[-20:])
+        close_position = 1.0 if high <= low else (latest.close - low) / (high - low)
+        center, upper, lower, width = bollinger_limits(closes[-20:])
+
+        active = (
+            0.35 * clamp(momentum3 / 1.8, -1.0, 1.0)
+            + 0.25 * clamp(momentum8 / 3.2, -1.0, 1.0)
+            + 0.20 * clamp((volume_ratio - 1.0) / 2.5, -0.5, 1.0)
+            + 0.15 * close_position
+            - 0.15 * max((rsi - 74.0) / 18.0, 0.0)
+        )
+        breakout = (
+            0.45 * (1.0 if latest.close > upper and momentum1 > 0 else 0.0)
+            + 0.25 * clamp(momentum3 / 2.0, -1.0, 1.0)
+            + 0.20 * clamp((volume_ratio - 1.0) / 2.0, -0.5, 1.0)
+            + 0.10 * clamp(width / 6.0, 0.0, 1.0)
+            - 0.12 * max((rsi - 76.0) / 18.0, 0.0)
+        )
+        reversal = (
+            0.40 * (1.0 if latest.low <= lower * 1.006 and latest.close > previous.close else 0.0)
+            + 0.25 * clamp((45.0 - rsi) / 24.0, -0.5, 1.0)
+            + 0.20 * clamp((center / latest.close - 1.0) * 100.0 / 2.5, -0.5, 1.0)
+            + 0.15 * clamp((volume_ratio - 0.8) / 2.2, -0.5, 1.0)
+        )
+        if breakout >= reversal and breakout >= active:
+            return breakout + 0.03, f"hybrid breakout score {breakout:.2f} m3 {momentum3:.2f}% vol {volume_ratio:.2f}x rsi {rsi:.1f}"
+        if reversal >= active:
+            return reversal + 0.02, f"hybrid reversal score {reversal:.2f} m1 {momentum1:.2f}% rsi {rsi:.1f}"
+        return active, f"hybrid active score {active:.2f} m3 {momentum3:.2f}% vol {volume_ratio:.2f}x rsi {rsi:.1f}"
+
     def _entry_time_block(self, timestamp) -> tuple[bool, str]:
         blocked_hours = set(self.config.strategy.blocked_entry_hours_kst)
         if not blocked_hours:
@@ -613,6 +766,23 @@ class MultiMarketTradingApp:
         close_position = 1.0 if candle_range <= 0 else (latest.close - latest.low) / candle_range
         recovered_price = latest.close >= short_ma or latest.close >= previous.close
         strong_recovery = recovery_momentum >= self.config.strategy.min_validated_recovery_pct or one_candle_recovery >= self.config.strategy.min_validated_recovery_pct
+        if "daily participation setup" in signal.reason:
+            if volume_ratio < 0.65:
+                return False, f"validated recovery blocked: daily participation volume {volume_ratio:.2f}x"
+            if close_position < 0.34:
+                return False, f"validated recovery blocked: daily participation close position {close_position:.2f}"
+            rsi = calculate_rsi(closes, self.config.strategy.rsi_period)
+            if rsi is not None and not 26.0 <= rsi <= 69.0:
+                return False, f"validated recovery blocked: daily participation RSI {rsi:.1f}"
+            if one_candle_recovery < -0.22 and recovery_momentum < -0.45:
+                return False, (
+                    "validated recovery blocked: daily participation falling "
+                    f"{recovery_momentum:.2f}%/{one_candle_recovery:.2f}%"
+                )
+            return True, (
+                f"validated daily participation ok: recovery {recovery_momentum:.2f}%, "
+                f"one-candle {one_candle_recovery:.2f}%, volume {volume_ratio:.2f}x"
+            )
         if "trend breakout setup" in signal.reason:
             if recovery_momentum < self.config.strategy.min_validated_recovery_pct and one_candle_recovery < 0.05:
                 return False, (
@@ -730,6 +900,10 @@ class MultiMarketTradingApp:
             return 1.0
         edge = score - self.config.risk.min_candidate_score
         reason = signal.reason.lower()
+        if "daily participation setup" in reason:
+            if signal.confidence >= 0.60 and edge >= 0.04:
+                return 0.92
+            return 0.82
         if "composite engine setup: qullamaggie ucl breakout" in reason:
             if signal.confidence >= 0.72 and edge >= 0.08:
                 return 1.22
@@ -782,6 +956,8 @@ class MultiMarketTradingApp:
             return max(configured, 0.58)
         if "composite engine setup" in reason:
             return max(configured, 0.70)
+        if "daily participation setup" in reason:
+            return max(configured, 0.85)
         return configured
 
     def _entry_filter_penalty_for_signal(self, signal: Signal, filter_reason: str, filter_penalty: float) -> float:
@@ -795,6 +971,8 @@ class MultiMarketTradingApp:
     def _breadth_penalty_for_candidate(self, score: float, signal: Signal, breadth_penalty: float) -> float:
         if breadth_penalty <= 0:
             return 0.0
+        if "daily participation setup" in signal.reason:
+            return 0.0
         if signal.confidence >= 0.72 and score >= self.config.risk.min_candidate_score + 0.14:
             return breadth_penalty * 0.35
         if signal.confidence >= 0.64 and score >= self.config.risk.min_candidate_score + 0.08:
@@ -803,11 +981,13 @@ class MultiMarketTradingApp:
 
     def _max_new_entries_for_context(self, context) -> int:
         configured = max(1, self.config.risk.max_new_entries_per_tick)
-        if self.risk.state.entries_today >= 3:
+        if self.risk.state.entries_today >= 8:
             return 1
         mode = str(getattr(context, "market_mode", "neutral"))
         if mode == "risk_on":
             return configured
+        if mode == "neutral":
+            return min(2, configured)
         return 1
 
     def _candidate_score_floor(self, context, equity: float | None = None) -> float:
@@ -830,10 +1010,10 @@ class MultiMarketTradingApp:
             base += 0.05
         if self.risk.state.entries_today >= 12:
             base += 0.14
-        elif self.risk.state.entries_today >= 6:
-            base += 0.10
-        elif self.risk.state.entries_today >= 3:
-            base += 0.06
+        elif self.risk.state.entries_today >= 8:
+            base += 0.08
+        elif self.risk.state.entries_today >= 5:
+            base += 0.04
         return base
 
     def _candidate_adaptive_gate(self, market: str, signal: Signal, context) -> tuple[bool, str]:
@@ -1201,6 +1381,8 @@ class MultiMarketTradingApp:
             self.position_entry_strategy.pop(market, None)
 
     def _entry_strategy_name(self, signal: Signal) -> str:
+        if "daily participation setup" in signal.reason:
+            return "daily_participation"
         if "composite engine setup" in signal.reason:
             return "composite_engine"
         if "bollinger rebound setup" in signal.reason:
@@ -1243,15 +1425,19 @@ class MultiMarketTradingApp:
             return signal
         market_name = str(market)
         entry_strategy = self._entry_strategy_for(market_name)
-        if entry_strategy not in {"range_rebound", "bollinger_rebound"}:
+        if entry_strategy not in {"range_rebound", "bollinger_rebound", "chart_ai", "composite_engine", "daily_participation"}:
             return signal
         entry_tick = self._entry_tick_for(market_name)
         if entry_tick is None:
             return signal
         if entry_strategy == "bollinger_rebound":
             grace_ticks = self.config.strategy.bollinger_trend_break_grace_ticks
-        else:
+        elif entry_strategy == "range_rebound":
             grace_ticks = self.config.strategy.range_rebound_trend_break_grace_ticks
+        elif entry_strategy == "daily_participation":
+            grace_ticks = max(6, self.config.strategy.range_rebound_trend_break_grace_ticks)
+        else:
+            grace_ticks = max(10, self.config.strategy.range_rebound_trend_break_grace_ticks)
         if grace_ticks <= 0:
             return signal
         held_ticks = tick - entry_tick
@@ -1467,6 +1653,23 @@ def candidate_score(candles: list[Candle], signal: Signal, config: StrategyConfi
     )
 
 
+def percent_change(current: float, previous: float) -> float:
+    return (current / previous - 1.0) * 100.0 if previous else 0.0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def bollinger_limits(values: list[float]) -> tuple[float, float, float, float]:
+    center = mean(values)
+    deviation = pstdev(values) if len(values) > 1 else 0.0
+    upper = center + 2.0 * deviation
+    lower = center - 2.0 * deviation
+    width = ((upper / lower) - 1.0) * 100.0 if lower > 0 else 0.0
+    return center, upper, lower, width
+
+
 def opportunity_score_for_signal(candles: list[Candle], signal: Signal, config: StrategyConfig) -> float:
     chart = chart_feature_snapshot(candles, config.rsi_period)
     expected_upside = estimate_signal_expected_upside_pct(candles, signal, config)
@@ -1515,6 +1718,8 @@ def orderbook_imbalance_penalty(imbalance_ratio: float, min_imbalance_ratio: flo
 
 def strategy_name_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "daily participation setup" in text:
+        return "daily_participation"
     if "composite engine setup" in text:
         return "composite_engine"
     if "bollinger rebound setup" in text:
@@ -1532,6 +1737,8 @@ def strategy_name_from_reason(reason: str) -> str:
 
 def reason_bucket_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "daily participation setup" in text:
+        return "daily_participation"
     if "composite engine setup: qullamaggie ucl breakout" in text:
         return "composite_qullamaggie_ucl"
     if "composite engine setup: lcl recovery rebound" in text:

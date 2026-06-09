@@ -11,7 +11,7 @@ from .config import AppConfig, load_config
 from .cloud_storage import get_cloud_storage, runtime_config
 from .data import UpbitPublicDataSource
 from .models import Position
-from .report import read_events, read_trades, render_report
+from .report import read_events, read_trades, render_compact_report
 from .risk import RiskState
 from .watch_multi import MultiMarketTradingApp
 
@@ -116,7 +116,7 @@ def run_cloud_ticks(
                 "storage": "remote" if storage.enabled else "local",
             }
 
-    effective_top_markets = min(max(1, top_markets), 12)
+    effective_top_markets = min(max(6, top_markets), 12)
     data_source = UpbitPublicDataSource()
     markets = data_source.get_top_krw_markets(effective_top_markets, min_trade_price_krw=config.strategy.min_price_krw)
     app = MultiMarketTradingApp(config, data_source, markets, request_delay=request_delay)
@@ -143,6 +143,7 @@ def run_cloud_ticks(
 
     save_state(config.paths.state_file, app, completed_tick, markets)
     app.journal.event("state_snapshot", build_state_snapshot(app, completed_tick, markets))
+    trim_runtime_logs(config, max_events=180)
     refresh_outputs(config, outputs)
     storage.persist(config)
     return {
@@ -299,10 +300,35 @@ def build_state_snapshot(app: MultiMarketTradingApp, tick: int, markets: list[st
 
 
 def refresh_outputs(config: AppConfig, outputs: list[Path]) -> None:
-    html = render_report(read_trades(config.paths.trade_journal), read_events(config.paths.event_log))
+    html = render_compact_report(read_trades(config.paths.trade_journal), read_events(config.paths.event_log)[-180:])
     for output in outputs:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(html, encoding="utf-8")
+
+
+def trim_runtime_logs(config: AppConfig, max_events: int = 180, max_trades: int = 120) -> None:
+    trim_jsonl(config.paths.event_log, max_events)
+    trim_csv(config.paths.trade_journal, max_trades)
+
+
+def trim_jsonl(path: Path, keep: int) -> None:
+    if keep <= 0 or not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= keep:
+        return
+    path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+
+
+def trim_csv(path: Path, keep: int) -> None:
+    if keep <= 0 or not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= keep + 1:
+        return
+    header = lines[:1]
+    rows = lines[1:]
+    path.write_text("\n".join(header + rows[-keep:]) + "\n", encoding="utf-8")
 
 
 def reset_outputs(outputs: list[Path]) -> None:
