@@ -418,14 +418,14 @@ class MovingAverageStrategy:
             base_confidence = 0.56
         elif (
             distance_from_low <= 1.8
-            and range_expansion >= 1.35
-            and volume_ratio >= max(2.4, self.config.min_volume_ratio * 1.8)
-            and momentum_3 >= 0.18
-            and momentum_8 >= -0.65
-            and close_position >= 0.72
-            and 24.0 <= rsi <= 48.0
-            and expected_upside_pct >= 1.9
-            and latest_price >= short_ma * 0.988
+            and range_expansion >= 1.55
+            and volume_ratio >= max(3.0, self.config.min_volume_ratio * 2.2)
+            and momentum_3 >= 0.45
+            and momentum_8 >= -0.20
+            and close_position >= 0.80
+            and 28.0 <= rsi <= 46.0
+            and expected_upside_pct >= 2.4
+            and latest_price >= short_ma * 0.995
         ):
             setup = "capitulation rebound"
             base_confidence = 0.57

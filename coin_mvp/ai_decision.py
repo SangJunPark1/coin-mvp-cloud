@@ -271,10 +271,19 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
     if features.get("impulse_quality_score", 0.0) < 0.58:
         return "AI hard block: impulse quality is too weak."
     if "micro recovery setup" in reason:
-        if mode != "risk_on":
-            return "AI hard block: micro recovery is only allowed in risk-on market mode."
+        if mode not in {"risk_on", "neutral"}:
+            return "AI hard block: micro recovery is blocked outside risk-on/neutral mode."
         if features.get("close_position", 0.0) < 0.65:
             return "AI hard block: micro recovery close position is weak."
+        if mode == "neutral" and features.get("reward_risk_ratio", 0.0) >= 2.8:
+            if (
+                features.get("close_position", 0.0) >= 0.92
+                and features.get("momentum_3_pct", 0.0) >= 0.35
+                and features.get("volume_ratio", 0.0) >= 1.45
+                and features.get("expected_upside_pct", 0.0) >= 2.2
+                and features.get("rsi", 0.0) <= 55.0
+            ):
+                return ""
         if features.get("momentum_8_pct", 0.0) < 0.55:
             return "AI hard block: micro recovery follow-through momentum is weak."
         if features.get("expected_upside_pct", 0.0) < 2.8:

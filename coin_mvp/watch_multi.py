@@ -142,18 +142,6 @@ class MultiMarketTradingApp:
                 },
             )
             return
-        if self.risk.state.consecutive_losses >= 1 and len(self.broker.open_markets()) >= 1:
-            self.journal.event(
-                "market_scan",
-                {
-                    "tick": tick,
-                    "markets_scanned": 0,
-                    "candidates": 0,
-                    "reason": "loss recovery mode: wait for open position to resolve",
-                    "risk": self.risk.state,
-                },
-            )
-            return
         if len(self.broker.open_markets()) >= self.config.risk.max_open_positions:
             return
         self._scan_and_enter(tick)
@@ -240,20 +228,6 @@ class MultiMarketTradingApp:
                 },
             )
             return
-        if str(getattr(context, "market_mode", "neutral")) != "risk_on" and self.broker.open_markets():
-            self.journal.event(
-                "market_scan",
-                {
-                    "tick": tick,
-                    "markets_scanned": 0,
-                    "candidates": 0,
-                    "reason": "neutral mode single-position limit",
-                    "decision_context": context.to_dict(),
-                    "risk": self.risk.state,
-                },
-            )
-            return
-
         candidates = []
         blocked_reasons: dict[str, int] = {}
         blocked_samples: list[dict[str, object]] = []
@@ -565,6 +539,20 @@ class MultiMarketTradingApp:
             except Exception:
                 rank_candles = candles[-90:]
             rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
+            if rank_score < 0.45:
+                continue
+            if chart["momentum_3_pct"] < 0.15:
+                continue
+            if chart["momentum_8_pct"] < 0.0:
+                continue
+            if chart["volume_ratio"] < 0.90:
+                continue
+            if chart["close_position"] < 0.72:
+                continue
+            if chart["rsi"] > 68.0:
+                continue
+            if expected_upside < max(1.80, expected_downside * 1.55):
+                continue
 
             confidence = 0.58
             confidence += min(max(chart["momentum_3_pct"], 0.0) * 0.05, 0.05)
@@ -590,8 +578,7 @@ class MultiMarketTradingApp:
             score += min(max(chart["volume_ratio"], 0.0) * 0.012, 0.045)
             score += min(max(chart["close_position"], 0.0) * 0.035, 0.035)
             score -= min(max(orderbook.spread_bps - spread_limit, 0.0) / 1000.0, 0.04)
-            floor = self._candidate_score_floor(context, self.broker.equity(self.last_prices))
-            score = max(score, floor + 0.08)
+            score -= min(max(expected_downside - expected_upside, 0.0) / 10.0, 0.08)
             if best is None or score > best[0]:
                 best = (score, market, candles, signal)
         return best
@@ -1308,7 +1295,11 @@ class MultiMarketTradingApp:
             return Signal(Side.HOLD, "no position", latest_price, 0.0)
         avg_price = position.avg_price
         pnl_pct = (latest_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
-        dynamic_stop_loss_pct = estimate_expected_downside_pct(candles, self.config.strategy.stop_loss_pct, self.config.strategy.stop_volatility_multiplier)
+        estimated_stop_loss_pct = estimate_expected_downside_pct(candles, self.config.strategy.stop_loss_pct, self.config.strategy.stop_volatility_multiplier)
+        dynamic_stop_loss_pct = min(
+            estimated_stop_loss_pct,
+            max(self.config.strategy.stop_loss_pct * 1.35, self._roundtrip_cost_pct() * 2.8),
+        )
         if pnl_pct <= -dynamic_stop_loss_pct:
             return Signal(Side.SELL, f"stop loss reached: {pnl_pct:.2f}%", latest_price, 0.95)
         if pnl_pct >= self.config.strategy.target_upside_pct:
@@ -1328,6 +1319,24 @@ class MultiMarketTradingApp:
             )
         peak_price = max(position.peak_price, latest_price)
         peak_pnl_pct = (peak_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
+        entry_tick = self._entry_tick_for(market)
+        held_ticks = 0 if entry_tick is None else tick - entry_tick
+        quick_lock_trigger_pct = max(self._roundtrip_cost_pct() * 1.8, min(self.config.strategy.partial_take_profit_pct, 0.45))
+        quick_lock_floor_pct = max(self._roundtrip_cost_pct() * 1.1, 0.08)
+        if peak_pnl_pct >= quick_lock_trigger_pct and pnl_pct <= quick_lock_floor_pct:
+            return Signal(
+                Side.SELL,
+                f"rotation profit lock: peak {peak_pnl_pct:.2f}%, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.88,
+            )
+        if held_ticks >= 3 and pnl_pct <= -max(0.18, self.config.strategy.stop_loss_pct * 0.65):
+            return Signal(
+                Side.SELL,
+                f"fast invalidation exit: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.9,
+            )
         breakeven_floor_pct = self._roundtrip_cost_pct() * 0.75
         if peak_pnl_pct >= self.config.strategy.breakeven_trigger_pct and pnl_pct <= breakeven_floor_pct:
             return Signal(
