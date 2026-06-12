@@ -267,7 +267,7 @@ class MultiMarketTradingApp:
                     blocked_samples.append({"market": market, "reason": filter_reason, "price": candles[-1].close})
                 continue
             signal = self.strategy.generate(candles, self.broker.get_position(market))
-            if signal.side != Side.BUY:
+            if signal.side != Side.BUY and not self.config.strategy.regime_ensemble_only:
                 signal = self._bollinger_rebound_entry_signal(candles, filter_reason, signal)
             if signal.side == Side.BUY:
                 strategy_gate_ok, strategy_gate_reason = self._candidate_adaptive_gate(market, signal, context)
@@ -324,14 +324,7 @@ class MultiMarketTradingApp:
             shortage = self.config.strategy.min_market_breadth_ratio - breadth_ratio
             breadth_penalty = min(0.35, shortage * 0.8)
         if not candidates:
-            participation = self._daily_participation_candidate(tick, candles_by_market, context, breadth_penalty)
-            if participation is not None:
-                candidates.append(participation)
-                blocked_reasons["daily participation fallback activated"] = (
-                    blocked_reasons.get("daily participation fallback activated", 0) + 1
-                )
-            else:
-                self.journal.event(
+            self.journal.event(
                     "market_scan",
                     {
                         "tick": tick,
@@ -346,24 +339,6 @@ class MultiMarketTradingApp:
                         "risk": self.risk.state,
                     },
                 )
-                return
-
-        if not candidates:
-            self.journal.event(
-                "market_scan",
-                {
-                    "tick": tick,
-                    "markets_scanned": len(self.markets),
-                    "candidates": 0,
-                    "reason": "no entry condition" if breadth_penalty <= 0 else f"no entry condition; breadth penalty {breadth_penalty:.2f}",
-                    "decision_context": context.to_dict(),
-                    "blocked_reasons": blocked_reasons,
-                    "blocked_samples": blocked_samples,
-                    "market_breadth_ratio": breadth_ratio,
-                    "market_breadth_penalty": breadth_penalty,
-                    "risk": self.risk.state,
-                },
-            )
             return
 
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -663,11 +638,11 @@ class MultiMarketTradingApp:
         mtf_ok, mtf_reason, mtf_penalty = self._five_minute_trend_ok(market)
         if not mtf_ok:
             override_ok, override_reason = self._one_minute_opportunity_override(candles)
-            if not override_ok:
-                return True, mtf_reason, 0.0
-            mtf_ok = True
-            mtf_reason = f"{mtf_reason}; {override_reason}"
-            mtf_penalty = max(mtf_penalty, 0.18)
+            if override_ok:
+                mtf_reason = f"{mtf_reason}; {override_reason}"
+                mtf_penalty = min(mtf_penalty, 0.04)
+            else:
+                mtf_penalty = min(max(mtf_penalty, 0.06), 0.12)
         bollinger_ok, bollinger_reason, bollinger_penalty = self._multi_timeframe_bollinger_ok(market)
         total_penalty = spread_penalty + imbalance_penalty + mtf_penalty
         reasons: list[str] = []
@@ -983,7 +958,10 @@ class MultiMarketTradingApp:
         if mode == "risk_on":
             base = max(0.0, base - 0.05)
         elif mode == "risk_off":
-            base += 0.10
+            # A weak broad market should reduce size, not silently eliminate every
+            # coin-specific breakout. Keep a small quality premium while allowing
+            # strong relative-strength candidates to reach the AI review stage.
+            base += 0.03
         elif mode == "capital_protect":
             return 999.0
         drawdown_pct = self._period_drawdown_pct(equity)
@@ -1001,6 +979,10 @@ class MultiMarketTradingApp:
             base += 0.08
         elif self.risk.state.entries_today >= 5:
             base += 0.04
+        # Avoid configuration drift or stacked adaptive penalties turning the bot
+        # into a permanent observer while it has no position.
+        if not self.broker.open_markets() and self.risk.state.entries_today == 0:
+            return min(base, self.config.risk.min_candidate_score + 0.05)
         return base
 
     def _candidate_adaptive_gate(self, market: str, signal: Signal, context) -> tuple[bool, str]:
@@ -1023,6 +1005,10 @@ class MultiMarketTradingApp:
         mode = str(getattr(context, "market_mode", "neutral"))
         if mode == "capital_protect":
             return False, "market mode blocked: capital protect"
+        if strategy_name == "regime_reversal" and mode == "risk_off":
+            return False, "market mode blocked: risk_off rejects regime_reversal"
+        if strategy_name in {"regime_breakout", "regime_trend"} and mode != "risk_on":
+            return False, f"market mode blocked: {mode} requires risk_on for {strategy_name}"
         if mode == "risk_off" and strategy_name in {"trend", "micro_recovery"}:
             return False, f"market mode blocked: {mode} rejects {strategy_name}"
         return True, "market mode ok"
@@ -1321,6 +1307,14 @@ class MultiMarketTradingApp:
         peak_pnl_pct = (peak_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
         entry_tick = self._entry_tick_for(market)
         held_ticks = 0 if entry_tick is None else tick - entry_tick
+        breakeven_floor_pct = self._roundtrip_cost_pct() * 0.75
+        if peak_pnl_pct >= self.config.strategy.breakeven_trigger_pct and pnl_pct <= breakeven_floor_pct:
+            return Signal(
+                Side.SELL,
+                f"breakeven stop reached: peak {peak_pnl_pct:.2f}%, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.82,
+            )
         quick_lock_trigger_pct = max(self._roundtrip_cost_pct() * 1.8, min(self.config.strategy.partial_take_profit_pct, 0.45))
         quick_lock_floor_pct = max(self._roundtrip_cost_pct() * 1.1, 0.08)
         if peak_pnl_pct >= quick_lock_trigger_pct and pnl_pct <= quick_lock_floor_pct:
@@ -1336,14 +1330,6 @@ class MultiMarketTradingApp:
                 f"fast invalidation exit: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
                 latest_price,
                 0.9,
-            )
-        breakeven_floor_pct = self._roundtrip_cost_pct() * 0.75
-        if peak_pnl_pct >= self.config.strategy.breakeven_trigger_pct and pnl_pct <= breakeven_floor_pct:
-            return Signal(
-                Side.SELL,
-                f"breakeven stop reached: peak {peak_pnl_pct:.2f}%, pnl {pnl_pct:.2f}%",
-                latest_price,
-                0.82,
             )
         if position.partial_exit_taken:
             locked_floor_pct = max(0.35, self._roundtrip_cost_pct() * 2.0)
@@ -1390,6 +1376,12 @@ class MultiMarketTradingApp:
             self.position_entry_strategy.pop(market, None)
 
     def _entry_strategy_name(self, signal: Signal) -> str:
+        if "regime ensemble setup" in signal.reason:
+            if "lcl reclaim reversal" in signal.reason:
+                return "regime_reversal"
+            if "ucl volatility breakout" in signal.reason:
+                return "regime_breakout"
+            return "regime_trend"
         if "daily participation setup" in signal.reason:
             return "daily_participation"
         if "composite engine setup" in signal.reason:
@@ -1434,7 +1426,7 @@ class MultiMarketTradingApp:
             return signal
         market_name = str(market)
         entry_strategy = self._entry_strategy_for(market_name)
-        if entry_strategy not in {"range_rebound", "bollinger_rebound", "chart_ai", "composite_engine", "daily_participation"}:
+        if entry_strategy not in {"range_rebound", "bollinger_rebound", "chart_ai", "composite_engine", "daily_participation", "regime_reversal"}:
             return signal
         entry_tick = self._entry_tick_for(market_name)
         if entry_tick is None:
@@ -1445,6 +1437,8 @@ class MultiMarketTradingApp:
             grace_ticks = self.config.strategy.range_rebound_trend_break_grace_ticks
         elif entry_strategy == "daily_participation":
             grace_ticks = max(6, self.config.strategy.range_rebound_trend_break_grace_ticks)
+        elif entry_strategy == "regime_reversal":
+            grace_ticks = max(4, self.config.strategy.range_rebound_trend_break_grace_ticks)
         else:
             grace_ticks = max(10, self.config.strategy.range_rebound_trend_break_grace_ticks)
         if grace_ticks <= 0:

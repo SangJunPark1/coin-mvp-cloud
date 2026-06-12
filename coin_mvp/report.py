@@ -86,8 +86,16 @@ def read_events(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
-            if line:
-                events.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # A killed or overlapping serverless run can leave one partial
+                # JSONL record. Keep the completed records usable for reports.
+                continue
+            if isinstance(event, dict):
+                events.append(event)
     return events
 
 
@@ -865,7 +873,12 @@ def render_ops_log(events: list[dict[str, Any]]) -> str:
             fill = payload.get("fill", {})
             text = f'{fill.get("market", "-")} {korean_side(str(fill.get("side", "-")))} 체결 · 손익 {krw(to_float(fill.get("realized_pnl")))}'
         elif name == "market_scan":
-            text = f'스캔 {payload.get("markets_scanned", 0)}개 · 후보 {payload.get("candidates", 0)}개 · {korean_reason(str(payload.get("reason", "")))}'
+            reason = korean_reason(str(payload.get("reason", "")))
+            blocked = payload.get("blocked_reasons", {})
+            if isinstance(blocked, dict) and blocked:
+                top_reason = max(blocked.items(), key=lambda item: int(item[1]))[0]
+                reason = f"{reason} · 주 차단: {korean_reason(str(top_reason))}"
+            text = f'스캔 {payload.get("markets_scanned", 0)}개 · 후보 {payload.get("candidates", 0)}개 · {reason}'
         elif name == "watch_error":
             text = f'오류 · {payload.get("error", "-")}'
         else:

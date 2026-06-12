@@ -72,6 +72,7 @@ class StrategyConfig:
     crash_candle_body_pct: float = 1.2
     crash_candle_volume_ratio: float = 1.4
     crash_candle_break_lookback: int = 12
+    regime_ensemble_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -221,6 +222,7 @@ def load_config(path: str | Path) -> AppConfig:
             crash_candle_body_pct=float(strategy.get("crash_candle_body_pct", 1.2)),
             crash_candle_volume_ratio=float(strategy.get("crash_candle_volume_ratio", 1.4)),
             crash_candle_break_lookback=int(strategy.get("crash_candle_break_lookback", 12)),
+            regime_ensemble_only=bool(strategy.get("regime_ensemble_only", False)),
         ),
         risk=RiskConfig(
             daily_profit_target_pct=float(risk["daily_profit_target_pct"]),

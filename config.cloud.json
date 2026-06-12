@@ -1,7 +1,7 @@
 {
   "mode": "paper",
   "market": "KRW-BTC",
-  "poll_seconds": 900,
+  "poll_seconds": 300,
   "starting_cash": 1000000,
   "fee_rate": 0.0005,
   "slippage_bps": 5,
@@ -69,7 +69,8 @@
     "crash_candle_lookback": 3,
     "crash_candle_body_pct": 1.2,
     "crash_candle_volume_ratio": 1.4,
-    "crash_candle_break_lookback": 12
+    "crash_candle_break_lookback": 12,
+    "regime_ensemble_only": true
   },
   "risk": {
     "daily_profit_target_pct": 3.0,
@@ -92,7 +93,7 @@
     "min_recent_profit_factor": 1.08,
     "max_recent_loss_rate": 0.55,
     "strategy_exit_sample_size": 0,
-    "market_exit_sample_size": 0,
+    "market_exit_sample_size": 2,
     "min_strategy_expectancy_krw": 0,
     "min_market_expectancy_krw": 0,
     "max_strategy_loss_rate": 0.67,

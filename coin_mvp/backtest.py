@@ -10,10 +10,10 @@ from typing import Any
 from . import watch_multi as watch_multi_module
 from .config import AppConfig, PathConfig, load_config
 from .data import SampleMarketDataSource, UpbitPublicDataSource
-from .market_context import DecisionContext
+from .market_context import DecisionContext, candle_momentum_pct, classify_market_mode
 from .models import Candle, OrderbookSnapshot
 from .report import calculate_metrics, read_events, read_trades, render_report
-from .strategy import required_candle_count
+from .strategy import market_breadth_ratio, recent_volatility_pct, required_candle_count
 from .watch_multi import MultiMarketTradingApp
 
 
@@ -131,7 +131,10 @@ def run_backtest(
     app = MultiMarketTradingApp(config, replay, markets, request_delay=request_delay)
 
     original_context = watch_multi_module.collect_decision_context
-    watch_multi_module.collect_decision_context = lambda _data_source, _strategy: static_backtest_context()
+    watch_multi_module.collect_decision_context = lambda _data_source, _strategy: historical_backtest_context(
+        replay,
+        config,
+    )
     try:
         step = max(1, step_minutes)
         last_index = min(history_count - 1, warmup + max(1, ticks) * step)
@@ -259,6 +262,67 @@ def static_backtest_context() -> DecisionContext:
         mode_reason="offline replay",
         session_label="backtest",
         position_fraction_multiplier=1.0,
+        news_sentiment_score=0.0,
+        news_risk_headline_count=0,
+        news_positive_headline_count=0,
+        news_headlines=[],
+    )
+
+
+def historical_backtest_context(replay: ReplayDataSource, config: AppConfig) -> DecisionContext:
+    """Rebuild the market regime at the replay timestamp without future data."""
+    lookback = max(config.strategy.long_window, 30)
+    btc_candles = replay.get_recent_candles("KRW-BTC", lookback)
+    btc_momentum = candle_momentum_pct(btc_candles, lookback=5)
+    btc_volatility = recent_volatility_pct(btc_candles, lookback=20)
+    candles_by_market = {
+        market: replay.get_recent_candles(market, lookback)
+        for market in replay.markets
+    }
+    breadth = market_breadth_ratio(
+        candles_by_market,
+        config.strategy.short_window,
+        config.strategy.long_window,
+        min(config.strategy.long_trend_ema_window, lookback),
+    )
+
+    mode_score = 0.0
+    if btc_momentum >= 0.25:
+        mode_score += 1.5
+    elif btc_momentum >= 0.0:
+        mode_score += 0.6
+    else:
+        mode_score -= 1.0
+    if breadth >= 0.65:
+        mode_score += 0.8
+    elif breadth >= 0.50:
+        mode_score += 0.4
+    elif breadth < 0.30:
+        mode_score -= 1.0
+    if btc_volatility > 1.2 and btc_momentum < 0:
+        mode_score -= 0.5
+
+    market_mode, score_multiplier, position_multiplier = classify_market_mode(
+        mode_score,
+        btc_momentum,
+        None,
+        None,
+    )
+    reason = (
+        f"historical BTC momentum {btc_momentum:.2f}%; "
+        f"volatility {btc_volatility:.2f}%; breadth {breadth:.2f}; "
+        f"mode {market_mode} score {mode_score:.2f}"
+    )
+    return DecisionContext(
+        allows_entries=True,
+        reason=reason,
+        score_multiplier=score_multiplier,
+        btc_momentum_pct=btc_momentum,
+        btc_volatility_pct=btc_volatility,
+        market_mode=market_mode,
+        mode_reason=f"historical replay score {mode_score:.2f}",
+        session_label="historical_replay",
+        position_fraction_multiplier=position_multiplier,
         news_sentiment_score=0.0,
         news_risk_headline_count=0,
         news_positive_headline_count=0,

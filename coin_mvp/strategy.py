@@ -37,6 +37,11 @@ class MovingAverageStrategy:
                 return Signal(Side.SELL, "trend break", latest_price, 0.6)
             return Signal(Side.HOLD, "position open, no exit condition", latest_price, 0.2)
 
+        regime_signal = self._regime_ensemble_signal(candles, short_ma, long_ma)
+        if regime_signal is not None:
+            return regime_signal
+        if self.config.regime_ensemble_only:
+            return Signal(Side.HOLD, "regime ensemble: no aligned setup", latest_price, 0.1)
         composite_signal = self._control_band_composite_signal(candles, short_ma, long_ma)
         if composite_signal is not None:
             return composite_signal
@@ -56,37 +61,173 @@ class MovingAverageStrategy:
         if range_signal is not None:
             return range_signal
         if short_ma <= long_ma and latest_price <= long_ma:
-            return Signal(
-                Side.HOLD,
-                self._combine_hold_reasons(
-                    f"ma alignment failed: short {short_ma:.3f} <= long {long_ma:.3f}; price below long MA {latest_price:.3f} <= {long_ma:.3f}",
-                    range_reason,
-                ),
-                latest_price,
-                0.1,
-            )
+            return Signal(Side.HOLD, self._combine_hold_reasons(f"ma alignment failed: short {short_ma:.3f} <= long {long_ma:.3f}; price below long MA {latest_price:.3f} <= {long_ma:.3f}", range_reason), latest_price, 0.1)
         if short_ma <= long_ma:
-            return Signal(
-                Side.HOLD,
-                self._combine_hold_reasons(
-                    f"ma alignment failed: short {short_ma:.3f} <= long {long_ma:.3f}",
-                    range_reason,
-                ),
-                latest_price,
-                0.1,
-            )
+            return Signal(Side.HOLD, self._combine_hold_reasons(f"ma alignment failed: short {short_ma:.3f} <= long {long_ma:.3f}", range_reason), latest_price, 0.1)
         if latest_price <= long_ma:
-            return Signal(
-                Side.HOLD,
-                self._combine_hold_reasons(
-                    f"price below long MA: {latest_price:.3f} <= {long_ma:.3f}",
-                    range_reason,
-                ),
-                latest_price,
-                0.1,
-            )
+            return Signal(Side.HOLD, self._combine_hold_reasons(f"price below long MA: {latest_price:.3f} <= {long_ma:.3f}", range_reason), latest_price, 0.1)
         _, trend_reason, _ = self._trend_entry_quality(candles, short_ma, long_ma)
         return Signal(Side.HOLD, self._combine_hold_reasons(trend_reason, range_reason), latest_price, 0.1)
+
+    def _regime_ensemble_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
+        """Select one confirmed setup from control-band and trend regimes.
+
+        Entries require a two-candle state transition. This avoids treating a
+        single high-volume candle at its high as a reversal, which was the main
+        source of false recovery entries in replay validation.
+        """
+        features = chart_feature_snapshot(candles, self.config.rsi_period)
+        if not features or len(candles) < 24:
+            return None
+        latest = candles[-1].close
+        if latest <= 0:
+            return None
+        expected = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
+        momentum_3 = features["momentum_3_pct"]
+        momentum_8 = features["momentum_8_pct"]
+        volume = features["volume_ratio"]
+        close_position = features["close_position"]
+        rsi = features["rsi"]
+        ema21_gap = features["ema21_gap_pct"]
+        high_gap = features["recent_high_gap_pct"]
+        low_distance = features["distance_from_low_pct"]
+        expansion = features["range_expansion_ratio"]
+        trend_slope = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma > 0 else 0.0
+
+        closes = [candle.close for candle in candles]
+        previous = candles[-2]
+        previous_close = previous.close
+        previous_ema9 = calculate_ema(closes[:-1], 9)
+        ema9 = calculate_ema(closes, 9)
+        band_source = closes[-20:]
+        previous_band_source = closes[-21:-1]
+        center = mean(band_source)
+        previous_center = mean(previous_band_source)
+        deviation = math.sqrt(sum((value - center) ** 2 for value in band_source) / len(band_source))
+        previous_deviation = math.sqrt(
+            sum((value - previous_center) ** 2 for value in previous_band_source) / len(previous_band_source)
+        )
+        ucl = center + 2.0 * deviation
+        lcl = center - 2.0 * deviation
+        previous_ucl = previous_center + 2.0 * previous_deviation
+        previous_lcl = previous_center - 2.0 * previous_deviation
+        previous_close_position = (
+            1.0
+            if previous.high <= previous.low
+            else (previous.close - previous.low) / (previous.high - previous.low)
+        )
+
+        lcl_touched = previous.low <= previous_lcl * 1.006 or candles[-1].low <= lcl * 1.004
+        lcl_reclaimed = (
+            latest >= lcl * 1.002
+            and latest > previous_close
+            and latest > candles[-1].open
+        )
+        ucl_crossed = previous_close <= previous_ucl * 1.002 and latest >= ucl * 1.001
+        ema_pullback_reclaimed = (
+            previous_ema9 is not None
+            and ema9 is not None
+            and previous_close <= previous_ema9 * 1.002
+            and latest >= ema9 * 1.001
+            and latest > previous.high
+        )
+
+        trend_score = (
+            0.20 * clamp01((momentum_8 + 0.10) / 1.80)
+            + 0.18 * clamp01((momentum_3 + 0.05) / 0.75)
+            + 0.16 * clamp01((volume - 0.80) / 1.30)
+            + 0.14 * clamp01((close_position - 0.45) / 0.45)
+            + 0.12 * clamp01((ema21_gap + 0.20) / 1.20)
+            + 0.10 * clamp01((trend_slope + 0.05) / 0.55)
+            + 0.10 * clamp01((68.0 - abs(rsi - 55.0)) / 68.0)
+        )
+        breakout_score = (
+            0.24 * clamp01((0.75 - high_gap) / 0.75)
+            + 0.20 * clamp01((volume - 1.05) / 1.80)
+            + 0.18 * clamp01((momentum_3 - 0.10) / 0.80)
+            + 0.14 * clamp01((momentum_8 - 0.20) / 2.20)
+            + 0.12 * clamp01((close_position - 0.58) / 0.38)
+            + 0.12 * clamp01((expansion - 0.90) / 0.90)
+        )
+        rebound_score = (
+            0.22 * clamp01((3.20 - low_distance) / 3.20)
+            + 0.20 * clamp01((momentum_3 + 0.02) / 0.65)
+            + 0.16 * clamp01((volume - 0.85) / 1.60)
+            + 0.14 * clamp01((close_position - 0.48) / 0.45)
+            + 0.14 * clamp01((58.0 - rsi) / 28.0)
+            + 0.14 * clamp01((0.40 - abs(ema21_gap + 0.45)) / 0.40)
+        )
+
+        setups: list[tuple[float, str]] = []
+        if (
+            ema_pullback_reclaimed
+            and trend_score >= 0.66
+            and trend_slope >= 0.08
+            and momentum_8 >= 0.45
+            and momentum_3 >= 0.18
+            and 1.10 <= volume <= 4.5
+            and close_position >= 0.58
+            and ema21_gap >= -0.15
+            and 42.0 <= rsi <= 62.0
+            and expected >= 1.55
+        ):
+            setups.append((trend_score, "ema pullback reclaim"))
+        if (
+            trend_score >= 0.60
+            and trend_slope >= 0.05
+            and momentum_8 >= 0.45
+            and momentum_3 >= 0.25
+            and 1.15 <= volume <= 4.5
+            and close_position >= 0.62
+            and ema21_gap >= 0.0
+            and 40.0 <= rsi <= 60.0
+            and expected >= 1.50
+        ):
+            setups.append((trend_score, "relative strength continuation"))
+        if (
+            ucl_crossed
+            and breakout_score >= 0.68
+            and high_gap <= 0.45
+            and momentum_3 >= 0.40
+            and momentum_8 >= 0.70
+            and 1.35 <= volume <= 4.5
+            and close_position >= 0.68
+            and expansion >= 1.0
+            and 44.0 <= rsi <= 62.0
+            and expected >= 1.70
+        ):
+            setups.append((breakout_score, "ucl volatility breakout"))
+        if (
+            lcl_touched
+            and lcl_reclaimed
+            and rebound_score >= 0.58
+            and low_distance <= 2.2
+            and momentum_3 >= 0.10
+            and (momentum_3 >= 0.25 or rsi <= 35.0)
+            and momentum_8 <= 0.35
+            and 1.40 <= volume <= 4.2
+            and close_position >= 0.65
+            and previous_close_position <= 0.85
+            and -0.80 <= ema21_gap <= 0.35
+            and 29.0 <= rsi <= 42.0
+            and expected >= 1.40
+        ):
+            setups.append((rebound_score, "lcl reclaim reversal"))
+        if not setups:
+            return None
+        score, setup = max(setups, key=lambda item: item[0])
+        confidence = min(0.86, 0.48 + score * 0.48)
+        return Signal(
+            Side.BUY,
+            (
+                f"regime ensemble setup: {setup}; score {score:.2f}; "
+                f"momentum3 {momentum_3:.2f}%; momentum8 {momentum_8:.2f}%; "
+                f"volume {volume:.2f}x; RSI {rsi:.1f}; close position {close_position:.2f}; "
+                f"EMA21 gap {ema21_gap:.2f}%; expected upside {expected:.2f}%"
+            ),
+            latest,
+            confidence,
+        )
 
     def _trend_breakout_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
         closes = [c.close for c in candles]
@@ -665,6 +806,10 @@ def calculate_ema(closes: list[float], period: int) -> float | None:
     return ema
 
 
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
 def recent_volatility_pct(candles: list[Candle], lookback: int = 20) -> float:
     closes = [c.close for c in candles[-(lookback + 1) :]]
     if len(closes) < 3:
@@ -749,6 +894,7 @@ def estimate_signal_expected_upside_pct(candles: list[Candle], signal: Signal, c
     reason = signal.reason.lower()
     if (
         "trend breakout setup" in reason
+        or "regime ensemble setup" in reason
         or "pullback continuation setup" in reason
         or "micro recovery setup" in reason
         or "chart ai setup" in reason
