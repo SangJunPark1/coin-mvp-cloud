@@ -1452,6 +1452,143 @@ def make_variable_candles(closes: list[float], volumes: list[float]) -> list[Can
     ]
 
 
+class RegimeEnsembleGateTest(unittest.TestCase):
+    def test_regime_reason_is_classified_by_setup(self):
+        app = make_test_app()
+
+        self.assertEqual(
+            "regime_reversal",
+            app._entry_strategy_name(Signal(Side.BUY, "regime ensemble setup: lcl reclaim reversal", 100.0)),
+        )
+        self.assertEqual(
+            "regime_breakout",
+            app._entry_strategy_name(Signal(Side.BUY, "regime ensemble setup: ucl volatility breakout", 100.0)),
+        )
+        self.assertEqual(
+            "regime_trend",
+            app._entry_strategy_name(Signal(Side.BUY, "regime ensemble setup: ema pullback reclaim", 100.0)),
+        )
+
+    def test_neutral_mode_allows_reversal_but_rejects_trend_chasing(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="neutral",
+        )
+
+        reversal_ok, _ = app._market_mode_allows_strategy("regime_reversal", context)
+        breakout_ok, _ = app._market_mode_allows_strategy("regime_breakout", context)
+        trend_ok, _ = app._market_mode_allows_strategy("regime_trend", context)
+
+        self.assertTrue(reversal_ok)
+        self.assertFalse(breakout_ok)
+        self.assertFalse(trend_ok)
+
+    def test_risk_off_rejects_reversal(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=0.82,
+            btc_momentum_pct=-0.2,
+            btc_volatility_pct=0.5,
+            market_mode="risk_off",
+        )
+
+        allowed, reason = app._market_mode_allows_strategy("regime_reversal", context)
+
+        self.assertFalse(allowed)
+        self.assertIn("risk_off", reason)
+
+    def test_daily_participation_allows_risk_off_quota_entry(self):
+        app = make_test_app()
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=0.82,
+            btc_momentum_pct=-0.2,
+            btc_volatility_pct=0.5,
+            market_mode="risk_off",
+        )
+
+        allowed, reason = app._market_mode_allows_strategy("daily_participation", context)
+
+        self.assertTrue(allowed)
+        self.assertEqual("market mode ok", reason)
+
+    def test_daily_participation_candidate_created_until_min_entries_met(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(
+                app.config.strategy,
+                stop_loss_pct=0.55,
+                stop_volatility_multiplier=0.55,
+                min_price_krw=300.0,
+                max_orderbook_spread_bps=24.0,
+            ),
+            risk=replace(app.config.risk, min_entries_per_day=4, min_candidate_score=0.44),
+        )
+        closes = [
+            1000,
+            1001,
+            999,
+            1002,
+            1000,
+            1003,
+            1002,
+            1004,
+            1003,
+            1005,
+            1004,
+            1006,
+            1005,
+            1007,
+            1006,
+            1008,
+            1007,
+            1009,
+            1008,
+            1010,
+        ]
+        candles = make_variable_candles(closes, [10.0] * len(closes))
+        app.data_source.get_orderbook_snapshot = lambda *_args, **_kwargs: OrderbookSnapshot(
+            market="KRW-TEST",
+            timestamp=datetime(2026, 4, 20, tzinfo=timezone.utc),
+            best_bid_price=1014.8,
+            best_bid_size=1.0,
+            best_ask_price=1015.2,
+            best_ask_size=1.0,
+            total_bid_size=10.0,
+            total_ask_size=10.0,
+        )
+        app.data_source.get_recent_candles = lambda *_args, **_kwargs: candles
+        context = DecisionContext(
+            allows_entries=True,
+            reason="test",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.1,
+            market_mode="neutral",
+        )
+
+        candidate = app._daily_participation_candidate(1, {"KRW-TEST": candles}, context, 0.0)
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        score, market, _candles, signal = candidate
+        self.assertEqual("KRW-TEST", market)
+        self.assertIn("quota 1/4", signal.reason)
+        self.assertGreaterEqual(score, app.config.risk.min_candidate_score - 0.10)
+
+        app.risk.state.entries_today = 4
+        self.assertIsNone(app._daily_participation_candidate(2, {"KRW-TEST": candles}, context, 0.0))
+
+
 class DummyDataSource:
     def get_recent_candles(self, *args, **kwargs):
         raise NotImplementedError

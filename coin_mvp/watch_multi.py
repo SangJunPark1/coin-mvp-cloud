@@ -323,6 +323,9 @@ class MultiMarketTradingApp:
         if breadth_ratio < self.config.strategy.min_market_breadth_ratio:
             shortage = self.config.strategy.min_market_breadth_ratio - breadth_ratio
             breadth_penalty = min(0.35, shortage * 0.8)
+        participation_candidate = self._daily_participation_candidate(tick, candles_by_market, context, breadth_penalty)
+        if participation_candidate is not None:
+            candidates.append(participation_candidate)
         if not candidates:
             self.journal.event(
                     "market_scan",
@@ -354,6 +357,8 @@ class MultiMarketTradingApp:
                 continue
             equity = self.broker.equity(self.last_prices)
             score_floor = self._candidate_score_floor(context, equity)
+            if "daily participation setup" in signal.reason:
+                score_floor = min(score_floor, self.config.risk.min_candidate_score - 0.12)
             if score < score_floor:
                 reason = f"candidate score below floor: {score:.2f} < {score_floor:.2f}"
                 blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
@@ -466,6 +471,8 @@ class MultiMarketTradingApp:
         context,
         breadth_penalty: float,
     ) -> tuple[float, str, list[Candle], Signal] | None:
+        if self.risk.state.entries_today >= self.config.risk.min_entries_per_day:
+            return None
         if self.risk.state.entries_today >= self.config.risk.max_entries_per_day:
             return None
         if self.broker.open_markets():
@@ -478,6 +485,12 @@ class MultiMarketTradingApp:
         for market, candles in candles_by_market.items():
             if self.broker.get_position(market).is_open:
                 continue
+            reentry_until = self.market_reentry_until_tick.get(market)
+            if reentry_until is not None and tick < reentry_until:
+                continue
+            self._prune_stopouts(market, tick)
+            if len(self.market_stopout_ticks.get(market, [])) >= self.config.strategy.max_recent_stopouts_per_market:
+                continue
             if candles[-1].close < self.config.strategy.min_price_krw:
                 continue
             crash_risk, _crash_reason = bearish_crash_candle_risk(candles, self.config.strategy)
@@ -486,12 +499,15 @@ class MultiMarketTradingApp:
             chart = chart_feature_snapshot(candles, self.config.strategy.rsi_period)
             if not chart:
                 continue
+            if len(candles) >= 2 and candles[-1].close <= candles[-2].close:
+                continue
             try:
                 orderbook = self.data_source.get_orderbook_snapshot(market)
             except Exception:
-                continue
+                orderbook = None
             spread_limit = self.config.strategy.max_orderbook_spread_bps
-            if orderbook.spread_bps > max(95.0, spread_limit * 6.0):
+            spread_bps = float(orderbook.spread_bps) if orderbook is not None else spread_limit
+            if spread_bps > max(120.0, spread_limit * 7.0):
                 continue
             expected_upside = estimate_signal_expected_upside_pct(
                 candles,
@@ -503,9 +519,9 @@ class MultiMarketTradingApp:
                 self.config.strategy.stop_loss_pct,
                 self.config.strategy.stop_volatility_multiplier,
             )
-            if chart["volume_ratio"] < 0.12:
+            if chart["volume_ratio"] < 0.08:
                 continue
-            if chart["momentum_8_pct"] < -2.6 and chart["close_position"] < 0.25:
+            if chart["momentum_8_pct"] < -4.0 and chart["close_position"] < 0.18:
                 continue
             if chart["rsi"] >= 95.0:
                 continue
@@ -514,19 +530,16 @@ class MultiMarketTradingApp:
             except Exception:
                 rank_candles = candles[-90:]
             rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
-            if rank_score < 0.45:
+            has_quality_hook = (
+                rank_score >= 0.05
+                or chart["momentum_3_pct"] >= 0.08
+                or (chart["close_position"] >= 0.58 and chart["momentum_8_pct"] >= -0.45)
+            )
+            if not has_quality_hook:
                 continue
-            if chart["momentum_3_pct"] < 0.15:
+            if chart["volume_ratio"] < 0.35 and rank_score < 0.12:
                 continue
-            if chart["momentum_8_pct"] < 0.0:
-                continue
-            if chart["volume_ratio"] < 0.90:
-                continue
-            if chart["close_position"] < 0.72:
-                continue
-            if chart["rsi"] > 68.0:
-                continue
-            if expected_upside < max(1.80, expected_downside * 1.55):
+            if expected_upside < max(0.45, expected_downside * 0.75):
                 continue
 
             confidence = 0.58
@@ -540,20 +553,24 @@ class MultiMarketTradingApp:
                 confidence -= 0.01
             confidence = min(0.74, max(0.56, confidence))
             reason = (
-                "daily participation setup: hybrid rank active entry; "
+                f"daily participation setup: quota {self.risk.state.entries_today + 1}/{self.config.risk.min_entries_per_day}; "
                 f"{rank_reason}; "
                 f"momentum3 {chart['momentum_3_pct']:.2f}%; momentum8 {chart['momentum_8_pct']:.2f}%; "
                 f"volume {chart['volume_ratio']:.2f}x; RSI {chart['rsi']:.1f}; "
                 f"close position {chart['close_position']:.2f}; expected upside {expected_upside:.2f}%; "
-                f"spread {orderbook.spread_bps:.1f}bps"
+                f"expected downside {expected_downside:.2f}%; spread {spread_bps:.1f}bps"
             )
             signal = Signal(Side.BUY, reason, candles[-1].close, confidence)
             score = candidate_score(candles, signal, self.config.strategy, penalty=breadth_penalty * 0.20)
-            score += max(rank_score, -0.12) * 0.42
-            score += min(max(chart["volume_ratio"], 0.0) * 0.012, 0.045)
-            score += min(max(chart["close_position"], 0.0) * 0.035, 0.035)
-            score -= min(max(orderbook.spread_bps - spread_limit, 0.0) / 1000.0, 0.04)
-            score -= min(max(expected_downside - expected_upside, 0.0) / 10.0, 0.08)
+            score += max(rank_score, -0.20) * 0.30
+            score += min(max(chart["volume_ratio"], 0.0) * 0.018, 0.06)
+            score += min(max(chart["close_position"], 0.0) * 0.05, 0.05)
+            score += min(max(chart["momentum_3_pct"], -0.3) * 0.06, 0.08)
+            score -= min(max(spread_bps - spread_limit, 0.0) / 900.0, 0.06)
+            score -= min(max(expected_downside - expected_upside, 0.0) / 9.0, 0.10)
+            if mode == "risk_off":
+                score -= 0.04
+            score = max(score, self.config.risk.min_candidate_score - 0.04)
             if best is None or score > best[0]:
                 best = (score, market, candles, signal)
         return best

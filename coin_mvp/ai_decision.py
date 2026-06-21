@@ -206,6 +206,8 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
         required = 0.62
     if "composite engine setup" in reason:
         required = min(required, 0.68 if mode in {"risk_on", "neutral"} else 0.74)
+    if "regime ensemble setup" in reason:
+        required = min(required, 0.66 if mode in {"risk_on", "neutral"} else 0.74)
     if "range rebound setup" in reason:
         required += 0.06
     if "micro recovery setup" in reason:
@@ -222,6 +224,16 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
 def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str, float]) -> str:
     reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
     mode = str(decision_input.get("market_context", {}).get("market_mode", "neutral")).lower()
+    if "regime ensemble setup" in reason:
+        if features.get("reward_risk_ratio", 0.0) < 1.65:
+            return "AI hard block: regime ensemble reward/risk is too weak."
+        if features.get("close_position", 0.0) < 0.54:
+            return "AI hard block: regime ensemble close quality is weak."
+        if features.get("volume_ratio", 0.0) < 1.0:
+            return "AI hard block: regime ensemble volume is too thin."
+        if features.get("rsi", 0.0) > 70.0:
+            return "AI hard block: regime ensemble entry is overheated."
+        return ""
     if "daily participation setup" in reason:
         if mode == "capital_protect":
             return "AI hard block: daily participation is blocked in capital-protect mode."

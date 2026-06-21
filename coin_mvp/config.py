@@ -82,6 +82,7 @@ class RiskConfig:
     max_entries_per_day: int
     max_position_fraction: float
     max_consecutive_losses: int
+    min_entries_per_day: int = 0
     new_entries_enabled: bool = True
     min_equity_krw: float = 0.0
     halt_cooldown_ticks: int = 6
@@ -228,6 +229,7 @@ def load_config(path: str | Path) -> AppConfig:
             daily_profit_target_pct=float(risk["daily_profit_target_pct"]),
             daily_loss_limit_pct=float(risk["daily_loss_limit_pct"]),
             max_entries_per_day=int(risk.get("max_entries_per_day", risk.get("max_trades_per_day", 3))),
+            min_entries_per_day=int(risk.get("min_entries_per_day", 0)),
             max_position_fraction=float(risk["max_position_fraction"]),
             max_consecutive_losses=int(risk["max_consecutive_losses"]),
             new_entries_enabled=bool(risk.get("new_entries_enabled", True)),
@@ -407,6 +409,10 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_total_position_fraction must be between 0 and 1.")
     if config.risk.max_entries_per_day < 1:
         raise ValueError("max_entries_per_day must be at least 1.")
+    if config.risk.min_entries_per_day < 0:
+        raise ValueError("min_entries_per_day must not be negative.")
+    if config.risk.min_entries_per_day > config.risk.max_entries_per_day:
+        raise ValueError("min_entries_per_day must not exceed max_entries_per_day.")
     if config.risk.min_equity_krw < 0:
         raise ValueError("min_equity_krw must not be negative.")
     if config.risk.max_new_entries_per_tick < 1:
