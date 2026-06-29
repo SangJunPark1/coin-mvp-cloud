@@ -84,6 +84,8 @@
     "max_total_position_fraction": 0.98,
     "max_new_entries_per_tick": 2,
     "min_trade_cash_krw": 680000,
+    "defensive_min_trade_cash_krw": 260000,
+    "panic_min_trade_cash_krw": 180000,
     "max_consecutive_losses": 6,
     "halt_cooldown_ticks": 3,
     "consecutive_loss_cooldown_ticks": 3,

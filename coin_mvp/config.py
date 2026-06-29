@@ -92,6 +92,8 @@ class RiskConfig:
     max_total_position_fraction: float = 0.95
     max_new_entries_per_tick: int = 1
     min_trade_cash_krw: float = 0.0
+    defensive_min_trade_cash_krw: float = 0.0
+    panic_min_trade_cash_krw: float = 0.0
     min_candidate_score: float = 0.0
     recent_exit_sample_size: int = 20
     min_recent_expectancy_krw: float = 0.0
@@ -241,6 +243,8 @@ def load_config(path: str | Path) -> AppConfig:
             max_total_position_fraction=float(risk.get("max_total_position_fraction", 0.95)),
             max_new_entries_per_tick=int(risk.get("max_new_entries_per_tick", 1)),
             min_trade_cash_krw=float(risk.get("min_trade_cash_krw", 0.0)),
+            defensive_min_trade_cash_krw=float(risk.get("defensive_min_trade_cash_krw", risk.get("min_trade_cash_krw", 0.0))),
+            panic_min_trade_cash_krw=float(risk.get("panic_min_trade_cash_krw", risk.get("defensive_min_trade_cash_krw", risk.get("min_trade_cash_krw", 0.0)))),
             min_candidate_score=float(risk.get("min_candidate_score", 0.0)),
             recent_exit_sample_size=int(risk.get("recent_exit_sample_size", 20)),
             min_recent_expectancy_krw=float(risk.get("min_recent_expectancy_krw", 0.0)),
@@ -419,6 +423,14 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("max_new_entries_per_tick must be at least 1.")
     if config.risk.min_trade_cash_krw < 0:
         raise ValueError("min_trade_cash_krw must not be negative.")
+    if config.risk.defensive_min_trade_cash_krw < 0:
+        raise ValueError("defensive_min_trade_cash_krw must not be negative.")
+    if config.risk.panic_min_trade_cash_krw < 0:
+        raise ValueError("panic_min_trade_cash_krw must not be negative.")
+    if config.risk.defensive_min_trade_cash_krw > config.risk.min_trade_cash_krw:
+        raise ValueError("defensive_min_trade_cash_krw must not exceed min_trade_cash_krw.")
+    if config.risk.panic_min_trade_cash_krw > config.risk.defensive_min_trade_cash_krw:
+        raise ValueError("panic_min_trade_cash_krw must not exceed defensive_min_trade_cash_krw.")
     if config.risk.min_candidate_score < 0:
         raise ValueError("min_candidate_score must not be negative.")
     if config.risk.recent_exit_sample_size < 0:

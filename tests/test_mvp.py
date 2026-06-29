@@ -1452,6 +1452,21 @@ def make_variable_candles(closes: list[float], volumes: list[float]) -> list[Can
     ]
 
 
+def make_intrabar_candles(open_price: float, high: float, low: float, close: float) -> list[Candle]:
+    base = make_candles([100.0] * 19, volume=10.0)
+    return base + [
+        Candle(
+            market="KRW-BTC",
+            timestamp=datetime(2026, 4, 20, 19, tzinfo=timezone.utc),
+            open=open_price,
+            high=high,
+            low=low,
+            close=close,
+            volume=10.0,
+        )
+    ]
+
+
 class RegimeEnsembleGateTest(unittest.TestCase):
     def test_regime_reason_is_classified_by_setup(self):
         app = make_test_app()
@@ -1520,13 +1535,13 @@ class RegimeEnsembleGateTest(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual("market mode ok", reason)
 
-    def test_daily_participation_candidate_created_until_min_entries_met(self):
+    def test_daily_participation_candidate_respects_quality_until_min_entries_met(self):
         app = make_test_app()
         app.config = replace(
             app.config,
             strategy=replace(
                 app.config.strategy,
-                stop_loss_pct=0.55,
+                stop_loss_pct=0.10,
                 stop_volatility_multiplier=0.55,
                 min_price_krw=300.0,
                 max_orderbook_spread_bps=24.0,
@@ -1535,25 +1550,25 @@ class RegimeEnsembleGateTest(unittest.TestCase):
         )
         closes = [
             1000,
+            1004,
             1001,
-            999,
-            1002,
-            1000,
-            1003,
-            1002,
-            1004,
-            1003,
             1005,
-            1004,
+            1002,
             1006,
-            1005,
+            1003,
             1007,
-            1006,
+            1004,
             1008,
-            1007,
+            1005,
             1009,
-            1008,
+            1006,
             1010,
+            1007,
+            1011,
+            1008,
+            1012,
+            1009,
+            1015,
         ]
         candles = make_variable_candles(closes, [10.0] * len(closes))
         app.data_source.get_orderbook_snapshot = lambda *_args, **_kwargs: OrderbookSnapshot(
@@ -1578,15 +1593,108 @@ class RegimeEnsembleGateTest(unittest.TestCase):
 
         candidate = app._daily_participation_candidate(1, {"KRW-TEST": candles}, context, 0.0)
 
-        self.assertIsNotNone(candidate)
-        assert candidate is not None
-        score, market, _candles, signal = candidate
-        self.assertEqual("KRW-TEST", market)
-        self.assertIn("quota 1/4", signal.reason)
-        self.assertGreaterEqual(score, app.config.risk.min_candidate_score - 0.10)
+        self.assertIsNone(candidate)
 
         app.risk.state.entries_today = 4
         self.assertIsNone(app._daily_participation_candidate(2, {"KRW-TEST": candles}, context, 0.0))
+
+    def test_intrabar_exit_uses_candle_low_for_stop(self):
+        app = make_test_app()
+        app.config = replace(app.config, strategy=replace(app.config.strategy, stop_loss_pct=0.5))
+        candles = make_intrabar_candles(open_price=100.0, high=100.2, low=99.4, close=99.8)
+        position = Position(qty=10.0, avg_price=100.0, peak_price=100.0)
+
+        signal = app._intrabar_position_signal(candles, position)
+
+        self.assertEqual(signal.side, Side.SELL)
+        self.assertIn("intrabar stop loss", signal.reason)
+        self.assertAlmostEqual(signal.price, 99.5)
+
+    def test_intrabar_exit_uses_candle_high_for_partial_profit(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(
+                app.config.strategy,
+                partial_take_profit_pct=0.4,
+                partial_take_profit_fraction=0.7,
+                take_profit_pct=1.5,
+            ),
+        )
+        candles = make_intrabar_candles(open_price=100.0, high=100.5, low=99.9, close=100.1)
+        position = Position(qty=10.0, avg_price=100.0, peak_price=100.0)
+
+        signal = app._intrabar_position_signal(candles, position)
+
+        self.assertEqual(signal.side, Side.SELL)
+        self.assertIn("intrabar partial take profit", signal.reason)
+        self.assertAlmostEqual(signal.price, 100.4)
+        self.assertAlmostEqual(signal.size_fraction, 0.7)
+
+    def test_daily_participation_uses_lower_cash_floor_in_risk_off(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            risk=replace(
+                app.config.risk,
+                min_trade_cash_krw=680_000,
+                defensive_min_trade_cash_krw=260_000,
+                panic_min_trade_cash_krw=180_000,
+            ),
+        )
+        signal = Signal(Side.BUY, "daily participation setup: quota 1/4", 100.0)
+        risk_off = DecisionContext(
+            allows_entries=True,
+            reason="weak market",
+            score_multiplier=0.82,
+            btc_momentum_pct=-0.4,
+            btc_volatility_pct=0.5,
+            market_mode="risk_off",
+            global_market_cap_change_pct=-2.8,
+            binance_btcusdt_change_pct=-2.1,
+        )
+        panic = replace(risk_off, market_mode="panic_rebound", global_market_cap_change_pct=-4.2)
+
+        self.assertEqual(app._min_trade_cash_for_context(risk_off, signal), 260_000)
+        self.assertEqual(app._min_trade_cash_for_context(panic, signal), 180_000)
+        self.assertEqual(app._min_trade_cash_for_context(risk_off, Signal(Side.BUY, "trend breakout setup", 100.0)), 680_000)
+
+    def test_risk_off_daily_participation_reduces_position_fraction(self):
+        app = make_test_app()
+        app.config = replace(
+            app.config,
+            strategy=replace(app.config.strategy, position_fraction=0.78, min_volatility_position_fraction=0.82),
+            risk=replace(
+                app.config.risk,
+                max_position_fraction=0.82,
+                min_trade_cash_krw=680_000,
+                defensive_min_trade_cash_krw=260_000,
+                panic_min_trade_cash_krw=180_000,
+            ),
+        )
+        candles = make_variable_candles([100, 101, 102, 103, 104, 105, 106, 107, 108, 109], [10.0] * 10)
+        neutral = DecisionContext(
+            allows_entries=True,
+            reason="neutral",
+            score_multiplier=1.0,
+            btc_momentum_pct=0.0,
+            btc_volatility_pct=0.2,
+            market_mode="neutral",
+        )
+        risk_off = replace(
+            neutral,
+            market_mode="risk_off",
+            position_fraction_multiplier=0.7,
+            btc_momentum_pct=-0.45,
+            global_market_cap_change_pct=-3.0,
+            binance_btcusdt_change_pct=-2.2,
+        )
+        signal = Signal(Side.BUY, "daily participation setup: quota 1/4", candles[-1].close, 0.6)
+
+        neutral_fraction = app._position_fraction_for_context(candles, neutral, equity=1_000_000, signal=signal, score=0.55)
+        risk_off_fraction = app._position_fraction_for_context(candles, risk_off, equity=1_000_000, signal=signal, score=0.55)
+
+        self.assertLess(risk_off_fraction, neutral_fraction * 0.55)
 
 
 class DummyDataSource:

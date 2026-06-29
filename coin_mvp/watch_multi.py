@@ -148,13 +148,16 @@ class MultiMarketTradingApp:
 
     def _manage_open_position(self, tick: int, market: str) -> None:
         candles = self.data_source.get_recent_candles(market, required_candle_count(self.config.strategy))
+        latest_candle = candles[-1]
         latest_price = candles[-1].close
         self.last_prices[market] = latest_price
         position = self.broker.get_position(market)
-        self.broker.mark_peak(market, latest_price)
+        self.broker.mark_peak(market, max(latest_price, latest_candle.high))
         equity = self.broker.equity(self.last_prices)
         self.risk.ensure_trading_day(candles[-1].timestamp, equity)
-        signal = self._position_management_signal(tick, market, candles, latest_price, position)
+        signal = self._intrabar_position_signal(candles, position)
+        if signal.side == Side.HOLD:
+            signal = self._position_management_signal(tick, market, candles, latest_price, position)
         if signal.side == Side.HOLD:
             signal = self.strategy.generate(candles, position)
         signal = self._apply_rebound_exit_grace(tick, market, latest_price, signal)
@@ -181,7 +184,50 @@ class MultiMarketTradingApp:
                     elif fill.realized_pnl > 0:
                         self.market_reentry_until_tick[market] = tick + max(1, cooldown)
                     self.position_entry_tick.pop(market, None)
-                    self.position_entry_strategy.pop(market, None)
+            self.position_entry_strategy.pop(market, None)
+
+    def _intrabar_position_signal(self, candles: list[Candle], position) -> Signal:
+        latest = candles[-1]
+        latest_price = latest.close
+        if not position.is_open or position.avg_price <= 0:
+            return Signal(Side.HOLD, "no intrabar exit", latest_price, 0.0)
+
+        avg_price = position.avg_price
+        stop_price = avg_price * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
+        full_take_price = avg_price * (1.0 + self.config.strategy.take_profit_pct / 100.0)
+        partial_take_price = avg_price * (1.0 + self.config.strategy.partial_take_profit_pct / 100.0)
+        breakeven_floor_price = avg_price * (1.0 + self._roundtrip_cost_pct() * 0.75 / 100.0)
+
+        if latest.high >= full_take_price:
+            return Signal(
+                Side.SELL,
+                f"intrabar take profit touched: {self.config.strategy.take_profit_pct:.2f}%",
+                full_take_price,
+                0.96,
+            )
+        if not position.partial_exit_taken and latest.high >= partial_take_price:
+            return Signal(
+                Side.SELL,
+                f"intrabar partial take profit touched: {self.config.strategy.partial_take_profit_pct:.2f}%",
+                partial_take_price,
+                0.92,
+                size_fraction=self.config.strategy.partial_take_profit_fraction,
+            )
+        if position.partial_exit_taken and position.peak_price >= partial_take_price and latest.low <= breakeven_floor_price:
+            return Signal(
+                Side.SELL,
+                "intrabar post-partial breakeven floor touched",
+                breakeven_floor_price,
+                0.9,
+            )
+        if latest.low <= stop_price:
+            return Signal(
+                Side.SELL,
+                f"intrabar stop loss touched: -{self.config.strategy.stop_loss_pct:.2f}%",
+                stop_price,
+                0.97,
+            )
+        return Signal(Side.HOLD, "no intrabar exit", latest_price, 0.0)
 
     def _scan_and_enter(self, tick: int) -> None:
         context = collect_decision_context(self.data_source, self.config.strategy)
@@ -416,22 +462,23 @@ class MultiMarketTradingApp:
             total_budget_remaining = max(0.0, equity * self.config.risk.max_total_position_fraction - invested)
             max_position_cash = equity * self.config.risk.max_position_fraction
             desired_cash = equity * position_fraction
-            if desired_cash < self.config.risk.min_trade_cash_krw:
-                desired_cash = min(self.config.risk.min_trade_cash_krw, max_position_cash)
+            min_trade_cash = self._min_trade_cash_for_context(context, signal)
+            if desired_cash < min_trade_cash:
+                desired_cash = min(min_trade_cash, max_position_cash)
             cash_to_use = min(
                 desired_cash,
                 max_position_cash,
                 total_budget_remaining,
                 self.broker.cash,
             )
-            if cash_to_use < self.config.risk.min_trade_cash_krw:
+            if cash_to_use < min_trade_cash:
                 self.journal.event(
                     "fill_skipped",
                     {
                         "tick": tick,
                         "market": market,
                         "signal": signal,
-                        "reason": f"trade cash below minimum: {cash_to_use:.0f} < {self.config.risk.min_trade_cash_krw:.0f}",
+                        "reason": f"trade cash below minimum: {cash_to_use:.0f} < {min_trade_cash:.0f}",
                     },
                 )
                 continue
@@ -525,6 +572,10 @@ class MultiMarketTradingApp:
                 continue
             if chart["rsi"] >= 95.0:
                 continue
+            latest = candles[-1]
+            stop_touch_price = latest.close * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
+            if latest.low <= stop_touch_price:
+                continue
             try:
                 rank_candles = self.data_source.get_recent_candles(market, 90, unit_minutes=15)
             except Exception:
@@ -532,15 +583,32 @@ class MultiMarketTradingApp:
             rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
             has_quality_hook = (
                 rank_score >= 0.05
-                or chart["momentum_3_pct"] >= 0.08
-                or (chart["close_position"] >= 0.58 and chart["momentum_8_pct"] >= -0.45)
+                or chart["momentum_3_pct"] >= 0.35
+                or (chart["close_position"] >= 0.72 and chart["momentum_8_pct"] >= 0.15)
             )
             if not has_quality_hook:
                 continue
-            if chart["volume_ratio"] < 0.35 and rank_score < 0.12:
+            if chart["volume_ratio"] < 0.75 and rank_score < 0.20:
                 continue
-            if expected_upside < max(0.45, expected_downside * 0.75):
+            if chart["close_position"] < 0.72 and chart["volume_ratio"] < 0.75:
                 continue
+            if chart["close_position"] < 0.65 and chart["volume_ratio"] < 1.0:
+                continue
+            if chart["momentum_3_pct"] < 0.15 and chart["momentum_8_pct"] < 0.15:
+                continue
+            if expected_upside < max(0.70, expected_downside * 1.35):
+                continue
+            if chart["rsi"] > 70.0:
+                continue
+            if self._is_defensive_market(context):
+                if chart["momentum_3_pct"] < 0.35:
+                    continue
+                if chart["volume_ratio"] < 0.75:
+                    continue
+                if chart["close_position"] < 0.62:
+                    continue
+                if rank_score < 0.0 and chart["momentum_8_pct"] < 0.05:
+                    continue
 
             confidence = 0.58
             confidence += min(max(chart["momentum_3_pct"], 0.0) * 0.05, 0.05)
@@ -570,6 +638,8 @@ class MultiMarketTradingApp:
             score -= min(max(expected_downside - expected_upside, 0.0) / 9.0, 0.10)
             if mode == "risk_off":
                 score -= 0.04
+            if self._is_defensive_market(context):
+                score -= 0.03
             score = max(score, self.config.risk.min_candidate_score - 0.04)
             if best is None or score > best[0]:
                 best = (score, market, candles, signal)
@@ -872,7 +942,47 @@ class MultiMarketTradingApp:
             multiplier *= self._reason_bucket_position_multiplier(signal)
             multiplier *= self._conviction_position_multiplier(signal, score)
             multiplier *= self._opportunity_position_multiplier(candles, signal)
+            if "daily participation setup" in signal.reason.lower():
+                if self._is_panic_market(context):
+                    multiplier *= 0.38
+                elif self._is_defensive_market(context):
+                    multiplier *= 0.55
+                if equity is not None and self.config.starting_cash > 0:
+                    drawdown_pct = (equity / self.config.starting_cash - 1.0) * 100.0
+                    if drawdown_pct <= -5.0:
+                        multiplier *= 0.70
         return min(self.config.risk.max_position_fraction, max(0.0, base * multiplier))
+
+    def _min_trade_cash_for_context(self, context, signal: Signal | None = None) -> float:
+        default = self.config.risk.min_trade_cash_krw
+        if signal is None or "daily participation setup" not in signal.reason.lower():
+            return default
+        if self._is_panic_market(context):
+            return min(default, self.config.risk.panic_min_trade_cash_krw)
+        if self._is_defensive_market(context):
+            return min(default, self.config.risk.defensive_min_trade_cash_krw)
+        return default
+
+    def _is_panic_market(self, context) -> bool:
+        mode = str(getattr(context, "market_mode", "neutral"))
+        global_change = float(getattr(context, "global_market_cap_change_pct", 0.0) or 0.0)
+        btc_change = float(getattr(context, "binance_btcusdt_change_pct", 0.0) or 0.0)
+        return mode == "panic_rebound" or global_change <= -4.0 or btc_change <= -3.0
+
+    def _is_defensive_market(self, context) -> bool:
+        mode = str(getattr(context, "market_mode", "neutral"))
+        global_change = float(getattr(context, "global_market_cap_change_pct", 0.0) or 0.0)
+        btc_change = float(getattr(context, "binance_btcusdt_change_pct", 0.0) or 0.0)
+        btc_momentum = float(getattr(context, "btc_momentum_pct", 0.0) or 0.0)
+        reason = str(getattr(context, "reason", "") or "")
+        weak_breadth_neutral = "mode neutral score -" in reason
+        return (
+            mode in {"risk_off", "panic_rebound"}
+            or global_change <= -2.5
+            or btc_change <= -2.0
+            or btc_momentum <= -0.35
+            or weak_breadth_neutral
+        )
 
     def _conviction_position_multiplier(self, signal: Signal, score: float | None) -> float:
         if score is None:
