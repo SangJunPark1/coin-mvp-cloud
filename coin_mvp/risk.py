@@ -75,13 +75,15 @@ class RiskManager:
             return False, "position fraction exceeds risk limit"
         return True, "approved"
 
-    def record_fill(self, fill: Fill) -> None:
+    def record_fill(self, fill: Fill, tick: int | None = None) -> None:
         if fill.side == Side.BUY:
             self.state.entries_today += 1
         elif fill.side == Side.SELL:
             self.state.exits_today += 1
             if fill.realized_pnl < 0:
                 self.state.consecutive_losses += 1
+                if self.state.consecutive_losses >= self.config.max_consecutive_losses:
+                    self._halt("max consecutive losses reached", tick, self.config.consecutive_loss_cooldown_ticks)
             elif fill.realized_pnl > 0:
                 self.state.consecutive_losses = 0
 

@@ -173,7 +173,7 @@ class MultiMarketTradingApp:
         if signal.side == Side.SELL:
             fill = self.broker.sell_fraction(market, signal.price, signal.size_fraction, signal.reason)
             if fill is not None:
-                self.risk.record_fill(fill)
+                self.risk.record_fill(fill, tick=tick)
                 self.journal.trade(fill)
                 self.journal.event("fill", {"tick": tick, "fill": fill, "risk": self.risk.state})
                 if not self.broker.get_position(market).is_open:
@@ -486,7 +486,7 @@ class MultiMarketTradingApp:
             if fill is None:
                 self.journal.event("fill_skipped", {"tick": tick, "signal": signal, "market": market})
                 continue
-            self.risk.record_fill(fill)
+            self.risk.record_fill(fill, tick=tick)
             self.journal.trade(fill)
             self.journal.event("fill", {"tick": tick, "fill": fill, "risk": self.risk.state})
             self.position_entry_tick[market] = tick
@@ -566,11 +566,15 @@ class MultiMarketTradingApp:
                 self.config.strategy.stop_loss_pct,
                 self.config.strategy.stop_volatility_multiplier,
             )
-            if chart["volume_ratio"] < 0.08:
+            if chart["volume_ratio"] < 0.65:
                 continue
             if chart["momentum_8_pct"] < -4.0 and chart["close_position"] < 0.18:
                 continue
             if chart["rsi"] >= 95.0:
+                continue
+            if chart["close_position"] < 0.60:
+                continue
+            if chart["momentum_8_pct"] < -0.55 and chart["momentum_3_pct"] < 0.25:
                 continue
             latest = candles[-1]
             stop_touch_price = latest.close * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
@@ -582,30 +586,37 @@ class MultiMarketTradingApp:
                 rank_candles = candles[-90:]
             rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
             has_quality_hook = (
-                rank_score >= 0.05
-                or chart["momentum_3_pct"] >= 0.35
-                or (chart["close_position"] >= 0.72 and chart["momentum_8_pct"] >= 0.15)
+                rank_score >= 0.12
+                or chart["momentum_3_pct"] >= 0.45
+                or (chart["close_position"] >= 0.78 and chart["momentum_8_pct"] >= 0.20)
             )
             if not has_quality_hook:
                 continue
-            if chart["volume_ratio"] < 0.75 and rank_score < 0.20:
+            if chart["momentum_3_pct"] < 0.30 and "reversal" in rank_reason:
                 continue
-            if chart["close_position"] < 0.72 and chart["volume_ratio"] < 0.75:
+            if chart["momentum_3_pct"] < 0.05 and rank_score < 0.22:
                 continue
-            if chart["close_position"] < 0.65 and chart["volume_ratio"] < 1.0:
+            if chart["volume_ratio"] < 0.85 and rank_score < 0.22:
+                continue
+            if chart["close_position"] < 0.68 and chart["volume_ratio"] < 1.15:
                 continue
             if chart["momentum_3_pct"] < 0.15 and chart["momentum_8_pct"] < 0.15:
                 continue
-            if expected_upside < max(0.70, expected_downside * 1.35):
+            min_upside = max(
+                0.75,
+                expected_downside * 1.55,
+                self._roundtrip_cost_pct() * 3.2,
+            )
+            if expected_upside < min_upside:
                 continue
             if chart["rsi"] > 70.0:
                 continue
             if self._is_defensive_market(context):
                 if chart["momentum_3_pct"] < 0.35:
                     continue
-                if chart["volume_ratio"] < 0.75:
+                if chart["volume_ratio"] < 1.05:
                     continue
-                if chart["close_position"] < 0.62:
+                if chart["close_position"] < 0.72:
                     continue
                 if rank_score < 0.0 and chart["momentum_8_pct"] < 0.05:
                     continue
@@ -1496,7 +1507,7 @@ class MultiMarketTradingApp:
             return
         fill = self.broker.sell_all(market, latest_price, f"forced exit: {self.risk.state.halt_reason}")
         if fill is not None:
-            self.risk.record_fill(fill)
+            self.risk.record_fill(fill, tick=tick)
             self.journal.trade(fill)
             self.journal.event("forced_exit", {"tick": tick, "fill": fill, "risk": self.risk.state})
             self.position_entry_tick.pop(market, None)

@@ -462,16 +462,16 @@ class MovingAverageStrategy:
         close_position = 1.0 if candle_range <= 0 else (candles[-1].close - candles[-1].low) / candle_range
         expected_upside_pct = estimate_trend_follow_through_pct(candles, self.config.target_upside_pct)
         price_near_ma = latest_price >= long_ma * 0.992 or latest_price >= short_ma * 0.996
-        stabilizing = one_candle_pct >= 0.12 and recent_momentum_pct >= 0.25
+        stabilizing = one_candle_pct >= 0.18 and recent_momentum_pct >= 0.55
         if not price_near_ma or not stabilizing:
             return None
-        if close_position < 0.42:
+        if close_position < 0.62:
             return None
-        if volume_ratio < max(1.6, self.config.min_volume_ratio):
+        if volume_ratio < max(2.2, self.config.min_volume_ratio * 1.6):
             return None
-        if expected_upside_pct < max(1.55, self.config.min_expected_upside_pct):
+        if expected_upside_pct < max(2.35, self.config.min_expected_upside_pct):
             return None
-        if rsi is not None and not 28.0 <= rsi <= 66.0:
+        if rsi is not None and not 34.0 <= rsi <= 58.0:
             return None
         confidence = min(
             0.68,

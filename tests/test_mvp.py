@@ -12,7 +12,7 @@ from coin_mvp.config import AiDecisionConfig, AppConfig, PathConfig, RiskConfig,
 from coin_mvp.data import UpbitPublicDataSource
 from coin_mvp.market_context import DecisionContext, maybe_float
 from coin_mvp.ml_decision import opportunity_edge_score, score_entry_with_feature_model
-from coin_mvp.models import Candle, OrderbookSnapshot, Position, Side, Signal
+from coin_mvp.models import Candle, Fill, OrderbookSnapshot, Position, Side, Signal
 from coin_mvp.news import score_headlines
 from coin_mvp.report import calculate_max_consecutive_losses, calculate_max_drawdown
 from coin_mvp.risk import RiskManager
@@ -232,6 +232,39 @@ class RiskManagerTest(unittest.TestCase):
         approved, _ = risk.approve(Signal(Side.BUY, "test", price=100.0), 1_000_000, 0.2, tick=12)
         self.assertTrue(approved)
         self.assertEqual(0, risk.state.consecutive_losses)
+
+    def test_record_fill_halts_immediately_on_max_consecutive_losses(self):
+        risk = RiskManager(
+            RiskConfig(
+                daily_profit_target_pct=3.0,
+                daily_loss_limit_pct=5.0,
+                max_entries_per_day=12,
+                max_position_fraction=0.35,
+                max_consecutive_losses=3,
+                consecutive_loss_cooldown_ticks=12,
+            ),
+            starting_equity=1_000_000,
+        )
+        loss_fill = Fill(
+            timestamp=datetime(2026, 4, 20, tzinfo=timezone.utc),
+            market="KRW-BTC",
+            side=Side.SELL,
+            price=100.0,
+            qty=1.0,
+            fee=0.0,
+            cash_after=999_900.0,
+            position_qty_after=0.0,
+            realized_pnl=-100.0,
+            reason="test loss",
+        )
+
+        risk.record_fill(loss_fill, tick=10)
+        risk.record_fill(loss_fill, tick=11)
+        risk.record_fill(loss_fill, tick=12)
+
+        self.assertTrue(risk.state.halted)
+        self.assertEqual("max consecutive losses reached", risk.state.halt_reason)
+        self.assertEqual(24, risk.state.halt_until_tick)
 
     def test_consecutive_loss_cooldown_can_be_shortened_after_state_was_saved(self):
         risk = RiskManager(
@@ -461,7 +494,7 @@ class StrategyFilterTest(unittest.TestCase):
         self.assertEqual(signal.side, Side.BUY)
         self.assertIn("range rebound setup", signal.reason)
 
-    def test_micro_recovery_can_buy_without_bollinger(self):
+    def test_weak_micro_recovery_is_rejected_without_bollinger(self):
         config = StrategyConfig(
             short_window=3,
             long_window=5,
@@ -481,8 +514,8 @@ class StrategyFilterTest(unittest.TestCase):
 
         signal = MovingAverageStrategy(config).generate(candles, Position())
 
-        self.assertEqual(signal.side, Side.BUY)
-        self.assertIn("micro recovery setup", signal.reason)
+        self.assertEqual(signal.side, Side.HOLD)
+        self.assertNotIn("micro recovery setup", signal.reason)
 
     def test_range_rebound_rejects_when_far_from_recent_low(self):
         config = StrategyConfig(

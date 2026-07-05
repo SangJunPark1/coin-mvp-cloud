@@ -90,7 +90,11 @@ def review_entry_candidate(
     grade = decision_grade(confidence, expected_upside, expected_downside, context.allows_entries)
     hard_block = upgraded_model_hard_block(decision_input, model_score.features)
 
-    if not context.allows_entries and not is_daily_participation:
+    if hard_block:
+        action = "hold"
+        risk_notes.append(hard_block)
+        thesis = "Upgraded AI model rejected the candidate despite the deterministic setup."
+    elif not context.allows_entries and not is_daily_participation:
         action = "pause"
         thesis = "Market context is unfavorable, so the candidate should not be opened."
     elif is_daily_participation:
@@ -99,10 +103,6 @@ def review_entry_candidate(
     elif expected_downside >= expected_upside:
         action = "hold"
         thesis = "Candidate risk/reward is unfavorable because downside is at least as large as upside."
-    elif hard_block:
-        action = "hold"
-        risk_notes.append(hard_block)
-        thesis = "Upgraded AI model rejected the candidate despite the deterministic setup."
     elif risk_notes and confidence < ai_config.min_confidence + 0.15:
         action = "hold"
         thesis = "Candidate has a deterministic signal, but the risk/reward evidence is not strong enough."
@@ -237,8 +237,18 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
     if "daily participation setup" in reason:
         if mode == "capital_protect":
             return "AI hard block: daily participation is blocked in capital-protect mode."
-        if features.get("volume_ratio", 0.0) < 0.08:
-            return "AI hard block: daily participation has almost no tradable volume."
+        strategy_limits = decision_input.get("strategy_limits", {})
+        configured_min_upside = float(strategy_limits.get("min_expected_upside_pct", 0.75) or 0.75)
+        if features.get("expected_upside_pct", 0.0) < max(0.75, configured_min_upside):
+            return "AI hard block: daily participation expected upside is too small."
+        if features.get("reward_risk_ratio", 0.0) < 1.55:
+            return "AI hard block: daily participation reward/risk is too weak."
+        if features.get("volume_ratio", 0.0) < 0.65:
+            return "AI hard block: daily participation volume is too thin."
+        if features.get("close_position", 0.0) < 0.60:
+            return "AI hard block: daily participation close quality is weak."
+        if features.get("momentum_8_pct", 0.0) < -0.55 and features.get("momentum_3_pct", 0.0) < 0.25:
+            return "AI hard block: daily participation has weak bounce after negative momentum."
         if features.get("rsi", 0.0) >= 95.0:
             return "AI hard block: daily participation is extremely overheated."
         if features.get("momentum_8_pct", 0.0) < -4.0 and features.get("close_position", 0.0) < 0.18:

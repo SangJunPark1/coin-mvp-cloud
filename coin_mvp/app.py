@@ -84,7 +84,7 @@ class TradingApp:
             if self.risk.state.halted and self.broker.position.is_open:
                 fill = self.broker.sell_all(latest_price, f"forced exit: {self.risk.state.halt_reason}")
                 if fill is not None:
-                    self.risk.record_fill(fill)
+                    self.risk.record_fill(fill, tick=tick)
                     self.journal.trade(fill)
                     self.journal.event("forced_exit", {"tick": tick, "fill": fill, "risk": self.risk.state})
                     self.position_entry_tick = None
@@ -104,7 +104,7 @@ class TradingApp:
             self.journal.event("fill_skipped", {"tick": tick, "signal": signal})
             return
 
-        self.risk.record_fill(fill)
+        self.risk.record_fill(fill, tick=tick)
         self.journal.trade(fill)
         self.journal.event("fill", {"tick": tick, "fill": fill, "risk": self.risk.state})
         if fill.side == Side.BUY:
