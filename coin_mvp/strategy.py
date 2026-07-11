@@ -276,18 +276,18 @@ class MovingAverageStrategy:
 
         ucl_break_pct = ((latest_price / prev_ucl) - 1.0) * 100.0 if prev_ucl > 0 else 0.0
         breakout = (
-            latest_price > prev_ucl * 1.001
+            latest_price > prev_ucl * 1.0005
             and latest_price >= recent_high * 0.998
-            and previous_price <= prev_ucl * 1.006
-            and volume_ratio >= max(2.2, self.config.min_volume_ratio * 1.6)
-            and close_position >= 0.78
-            and momentum_3 >= 0.45
-            and momentum_8 >= 1.75
-            and width_pct >= 1.75
-            and (ucl_break_pct >= 0.75 or momentum_3 >= 0.9)
-            and 38.0 <= rsi <= min(66.5, self.config.max_entry_rsi)
-            and expected_upside_pct >= max(2.4, self.config.min_expected_upside_pct)
-            and (short_ma >= long_ma * 0.998 or latest_price >= center)
+            and previous_price <= prev_ucl * 1.010
+            and volume_ratio >= max(1.45, self.config.min_volume_ratio * 1.20)
+            and close_position >= 0.58
+            and momentum_3 >= 0.25
+            and momentum_8 >= 0.35
+            and width_pct >= 0.90
+            and (ucl_break_pct >= 0.20 or momentum_3 >= 0.45)
+            and 38.0 <= rsi <= min(70.0, self.config.max_entry_rsi)
+            and expected_upside_pct >= max(1.25, self.config.min_expected_upside_pct)
+            and (short_ma >= long_ma * 0.996 or latest_price >= center)
         )
         if breakout:
             confidence = min(

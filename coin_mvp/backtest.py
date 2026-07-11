@@ -272,7 +272,8 @@ def static_backtest_context() -> DecisionContext:
 def historical_backtest_context(replay: ReplayDataSource, config: AppConfig) -> DecisionContext:
     """Rebuild the market regime at the replay timestamp without future data."""
     lookback = max(config.strategy.long_window, 30)
-    btc_candles = replay.get_recent_candles("KRW-BTC", lookback)
+    reference_market = "KRW-BTC" if "KRW-BTC" in replay.candles_by_unit.get(1, {}) else replay.markets[0]
+    btc_candles = replay.get_recent_candles(reference_market, lookback)
     btc_momentum = candle_momentum_pct(btc_candles, lookback=5)
     btc_volatility = recent_volatility_pct(btc_candles, lookback=20)
     candles_by_market = {

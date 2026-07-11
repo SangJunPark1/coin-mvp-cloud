@@ -233,6 +233,8 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
             return "AI hard block: regime ensemble volume is too thin."
         if features.get("rsi", 0.0) > 70.0:
             return "AI hard block: regime ensemble entry is overheated."
+        if "lcl reclaim reversal" in reason and features.get("momentum_8_pct", 0.0) < -0.25 and features.get("volume_ratio", 0.0) < 2.0:
+            return "AI hard block: LCL reclaim needs stronger volume when medium momentum is negative."
         return ""
     if "daily participation setup" in reason:
         if mode == "capital_protect":
@@ -243,7 +245,7 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
             return "AI hard block: daily participation expected upside is too small."
         if features.get("reward_risk_ratio", 0.0) < 1.55:
             return "AI hard block: daily participation reward/risk is too weak."
-        if features.get("volume_ratio", 0.0) < 0.65:
+        if features.get("volume_ratio", 0.0) < 0.90:
             return "AI hard block: daily participation volume is too thin."
         if features.get("close_position", 0.0) < 0.60:
             return "AI hard block: daily participation close quality is weak."
@@ -273,24 +275,35 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
     if "composite engine setup" in reason:
         if features.get("reward_risk_ratio", 0.0) < 1.75:
             return "AI hard block: composite engine reward/risk is too weak."
-        if features.get("volume_ratio", 0.0) < 1.25:
+        if features.get("volume_ratio", 0.0) < 1.15:
             return "AI hard block: composite engine volume is too thin."
         if features.get("close_position", 0.0) < 0.56:
             return "AI hard block: composite engine close position is weak."
         if "qullamaggie ucl breakout" in reason:
-            if features.get("momentum_3_pct", 0.0) < 0.12:
+            if features.get("momentum_3_pct", 0.0) < 0.18:
                 return "AI hard block: UCL breakout impulse is too weak."
-            if features.get("rsi", 0.0) > 69.0:
+            if features.get("rsi", 0.0) > 70.0:
                 return "AI hard block: UCL breakout RSI is too hot."
         if "lcl recovery rebound" in reason:
             if not 22.0 <= features.get("rsi", 0.0) <= 58.0:
                 return "AI hard block: LCL rebound RSI is outside recovery range."
             if features.get("momentum_3_pct", 0.0) < 0.02:
                 return "AI hard block: LCL rebound has not recovered yet."
+        if "lcl reclaim reversal" in reason:
+            if features.get("momentum_8_pct", 0.0) < -0.25 and features.get("volume_ratio", 0.0) < 2.0:
+                return "AI hard block: LCL reclaim needs stronger volume when medium momentum is negative."
         return ""
     if features.get("reward_risk_ratio", 0.0) < 2.15:
         return "AI hard block: reward/risk ratio is below 2.15."
-    if features.get("impulse_quality_score", 0.0) < 0.58:
+    trend_breakout_override = (
+        "trend breakout setup" in reason
+        and features.get("reward_risk_ratio", 0.0) >= 3.0
+        and features.get("volume_ratio", 0.0) >= 1.7
+        and features.get("close_position", 0.0) >= 0.90
+        and features.get("expected_upside_pct", 0.0) >= 1.75
+        and features.get("rsi", 0.0) <= 62.0
+    )
+    if features.get("impulse_quality_score", 0.0) < 0.58 and not trend_breakout_override:
         return "AI hard block: impulse quality is too weak."
     if "micro recovery setup" in reason:
         if mode not in {"risk_on", "neutral"}:
@@ -313,9 +326,13 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
         if features.get("rsi", 0.0) > 60.0:
             return "AI hard block: micro recovery RSI is too hot."
     if "trend breakout setup" in reason:
-        if mode != "risk_on" and features.get("expected_upside_pct", 0.0) < 2.9:
-            return "AI hard block: neutral/risk-off trend breakout needs at least 2.9% expected upside."
-        if mode != "risk_on" and features.get("volume_ratio", 0.0) < 1.55:
+        if trend_breakout_override:
+            return ""
+        if mode != "risk_on" and features.get("expected_upside_pct", 0.0) < 1.75:
+            return "AI hard block: neutral/risk-off trend breakout needs at least 1.75% expected upside."
+        if mode != "risk_on" and features.get("reward_risk_ratio", 0.0) < 2.6:
+            return "AI hard block: neutral/risk-off trend breakout reward/risk is too weak."
+        if mode != "risk_on" and features.get("volume_ratio", 0.0) < 1.45:
             return "AI hard block: neutral/risk-off trend breakout volume is not decisive enough."
         if mode != "risk_on" and features.get("volume_ratio", 0.0) > 3.5 and features.get("rsi", 0.0) > 64.0:
             return "AI hard block: neutral/risk-off trend breakout is too crowded."

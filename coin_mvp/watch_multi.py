@@ -405,7 +405,7 @@ class MultiMarketTradingApp:
             score_floor = self._candidate_score_floor(context, equity)
             if "daily participation setup" in signal.reason:
                 score_floor = min(score_floor, self.config.risk.min_candidate_score - 0.12)
-            if score < score_floor:
+            if score + 1e-6 < score_floor:
                 reason = f"candidate score below floor: {score:.2f} < {score_floor:.2f}"
                 blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
                 continue
@@ -566,7 +566,7 @@ class MultiMarketTradingApp:
                 self.config.strategy.stop_loss_pct,
                 self.config.strategy.stop_volatility_multiplier,
             )
-            if chart["volume_ratio"] < 0.65:
+            if chart["volume_ratio"] < 0.90:
                 continue
             if chart["momentum_8_pct"] < -4.0 and chart["close_position"] < 0.18:
                 continue
@@ -596,7 +596,7 @@ class MultiMarketTradingApp:
                 continue
             if chart["momentum_3_pct"] < 0.05 and rank_score < 0.22:
                 continue
-            if chart["volume_ratio"] < 0.85 and rank_score < 0.22:
+            if chart["volume_ratio"] < 1.05 and rank_score < 0.22:
                 continue
             if chart["close_position"] < 0.68 and chart["volume_ratio"] < 1.15:
                 continue
@@ -614,7 +614,7 @@ class MultiMarketTradingApp:
             if self._is_defensive_market(context):
                 if chart["momentum_3_pct"] < 0.35:
                     continue
-                if chart["volume_ratio"] < 1.05:
+                if chart["volume_ratio"] < 1.15:
                     continue
                 if chart["close_position"] < 0.72:
                     continue
@@ -1609,10 +1609,19 @@ class MultiMarketTradingApp:
             return signal
         held_ticks = tick - entry_tick
         pnl_pct = (latest_price / position.avg_price - 1.0) * 100.0
-        if held_ticks >= max_ticks and pnl_pct <= self.config.strategy.time_stop_min_pnl_pct:
+        profit_floor_pct = max(self.config.strategy.time_stop_min_pnl_pct, self._roundtrip_cost_pct() * 1.4)
+        loss_floor_pct = max(0.22, self.config.strategy.stop_loss_pct * 0.80)
+        if held_ticks >= max_ticks and pnl_pct >= profit_floor_pct:
             return Signal(
                 Side.SELL,
-                f"time stop reached: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
+                f"time profit lock reached: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.76,
+            )
+        if held_ticks >= max_ticks and pnl_pct <= -loss_floor_pct:
+            return Signal(
+                Side.SELL,
+                f"time invalidation stop reached: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
                 latest_price,
                 0.7,
             )
@@ -1632,6 +1641,14 @@ class MultiMarketTradingApp:
             return Signal(
                 Side.HOLD,
                 f"trend break watch: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.2,
+            )
+        entry_strategy = self._entry_strategy_for(market)
+        if entry_strategy in {"daily_participation", "regime_reversal", "composite_engine"} and held_ticks <= 5 and pnl_pct > -0.18:
+            return Signal(
+                Side.HOLD,
+                f"small trend break hold: {entry_strategy}, held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
                 latest_price,
                 0.2,
             )
