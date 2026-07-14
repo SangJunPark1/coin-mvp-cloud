@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -462,7 +462,7 @@ class StrategyFilterTest(unittest.TestCase):
         self.assertEqual(signal.side, Side.HOLD)
         self.assertIn("price below long MA", signal.reason)
 
-    def test_range_rebound_can_buy_in_weak_trend(self):
+    def test_range_rebound_helper_can_identify_weak_trend_bounce(self):
         config = StrategyConfig(
             short_window=3,
             long_window=5,
@@ -489,10 +489,102 @@ class StrategyFilterTest(unittest.TestCase):
             [10, 10, 10, 10, 10, 10, 10, 16],
         )
 
-        signal = MovingAverageStrategy(config).generate(candles, Position())
+        strategy = MovingAverageStrategy(config)
+        signal, _ = strategy._range_rebound_signal(candles, 99.5, 100.0)  # noqa: SLF001
 
+        self.assertIsNotNone(signal)
+        assert signal is not None
         self.assertEqual(signal.side, Side.BUY)
         self.assertIn("range rebound setup", signal.reason)
+
+    def test_cost_aware_edge_rejects_flat_low_edge_market(self):
+        config = StrategyConfig(
+            short_window=5,
+            long_window=20,
+            take_profit_pct=0.72,
+            stop_loss_pct=0.34,
+            position_fraction=0.72,
+            min_volume_ratio=0.8,
+            min_expected_upside_pct=0.85,
+            min_net_edge_pct=0.20,
+        )
+        closes = [
+            100.0,
+            100.02,
+            99.98,
+            100.01,
+            100.0,
+            100.03,
+            99.99,
+            100.02,
+            100.01,
+            100.0,
+            100.02,
+            99.98,
+            100.01,
+            100.0,
+            100.03,
+            99.99,
+            100.02,
+            100.01,
+            100.0,
+            100.02,
+            99.98,
+            100.01,
+            100.0,
+            100.02,
+            100.01,
+        ]
+        signal = MovingAverageStrategy(config).generate(make_candles(closes, volume=10.0), Position())
+
+        self.assertEqual(signal.side, Side.HOLD)
+        self.assertIn("cost-aware edge blocked", signal.reason)
+
+    def test_cost_aware_edge_buys_valid_breakout_after_costs(self):
+        config = StrategyConfig(
+            short_window=5,
+            long_window=20,
+            take_profit_pct=0.72,
+            stop_loss_pct=0.34,
+            position_fraction=0.72,
+            min_volume_ratio=0.8,
+            min_expected_upside_pct=0.75,
+            min_net_edge_pct=0.12,
+            target_upside_pct=2.2,
+            max_entry_rsi=74.0,
+        )
+        closes = [
+            102.0,
+            102.2,
+            102.0,
+            102.3,
+            102.1,
+            102.4,
+            102.2,
+            102.5,
+            102.3,
+            102.6,
+            102.4,
+            102.7,
+            102.5,
+            102.8,
+            102.6,
+            102.9,
+            102.7,
+            103.0,
+            102.8,
+            103.1,
+            102.9,
+            103.2,
+            103.0,
+            103.3,
+            103.9,
+        ]
+        volumes = [10.0] * (len(closes) - 1) + [22.0]
+        signal = MovingAverageStrategy(config).generate(make_variable_candles(closes, volumes), Position())
+
+        self.assertEqual(signal.side, Side.BUY)
+        self.assertIn("cost-aware edge setup", signal.reason)
 
     def test_weak_micro_recovery_is_rejected_without_bollinger(self):
         config = StrategyConfig(
@@ -1286,6 +1378,8 @@ class RangeReboundExitGraceTest(unittest.TestCase):
         self.assertGreater(high, normal)
 
     def test_strategy_name_from_reason_and_performance_stats(self):
+        self.assertEqual("cost_aware_edge", strategy_name_from_reason("cost-aware edge setup: breakout"))
+        self.assertEqual("cost_edge_breakout", reason_bucket_from_reason("cost-aware edge setup: breakout"))
         self.assertEqual("pullback", strategy_name_from_reason("pullback continuation setup: trend 0.3%"))
         self.assertEqual("chart_ai_momentum_ignition", reason_bucket_from_reason("chart ai setup: momentum ignition"))
         expectancy, profit_factor, loss_rate = performance_stats([1000.0, -500.0, 500.0])
@@ -1456,10 +1550,11 @@ class RangeReboundExitGraceTest(unittest.TestCase):
 
 
 def make_candles(closes: list[float], volume: float) -> list[Candle]:
+    base_time = datetime(2026, 4, 20, tzinfo=timezone.utc)
     return [
         Candle(
             market="KRW-BTC",
-            timestamp=datetime(2026, 4, 20, index, tzinfo=timezone.utc),
+            timestamp=base_time + timedelta(minutes=index),
             open=close,
             high=close,
             low=close,
@@ -1471,10 +1566,11 @@ def make_candles(closes: list[float], volume: float) -> list[Candle]:
 
 
 def make_variable_candles(closes: list[float], volumes: list[float]) -> list[Candle]:
+    base_time = datetime(2026, 4, 20, tzinfo=timezone.utc)
     return [
         Candle(
             market="KRW-BTC",
-            timestamp=datetime(2026, 4, 20, index, tzinfo=timezone.utc),
+            timestamp=base_time + timedelta(minutes=index),
             open=close,
             high=close,
             low=close,

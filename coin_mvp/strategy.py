@@ -37,29 +37,10 @@ class MovingAverageStrategy:
                 return Signal(Side.SELL, "trend break", latest_price, 0.6)
             return Signal(Side.HOLD, "position open, no exit condition", latest_price, 0.2)
 
-        regime_signal = self._regime_ensemble_signal(candles, short_ma, long_ma)
-        if regime_signal is not None:
-            return regime_signal
-        if self.config.regime_ensemble_only:
-            return Signal(Side.HOLD, "regime ensemble: no aligned setup", latest_price, 0.1)
-        composite_signal = self._control_band_composite_signal(candles, short_ma, long_ma)
-        if composite_signal is not None:
-            return composite_signal
-        trend_signal = self._trend_breakout_signal(candles, short_ma, long_ma)
-        if trend_signal is not None:
-            return trend_signal
-        pullback_signal = self._pullback_continuation_signal(candles, short_ma, long_ma)
-        if pullback_signal is not None:
-            return pullback_signal
-        micro_signal = self._micro_recovery_signal(candles, short_ma, long_ma)
-        if micro_signal is not None:
-            return micro_signal
-        chart_signal = self._chart_ai_signal(candles, short_ma, long_ma)
-        if chart_signal is not None:
-            return chart_signal
-        range_signal, range_reason = self._range_rebound_signal(candles, short_ma, long_ma)
-        if range_signal is not None:
-            return range_signal
+        edge_signal, edge_reason = self._cost_aware_edge_signal(candles, short_ma, long_ma)
+        if edge_signal is not None:
+            return edge_signal
+        range_reason = edge_reason
         if short_ma <= long_ma and latest_price <= long_ma:
             return Signal(Side.HOLD, self._combine_hold_reasons(f"ma alignment failed: short {short_ma:.3f} <= long {long_ma:.3f}; price below long MA {latest_price:.3f} <= {long_ma:.3f}", range_reason), latest_price, 0.1)
         if short_ma <= long_ma:
@@ -68,6 +49,212 @@ class MovingAverageStrategy:
             return Signal(Side.HOLD, self._combine_hold_reasons(f"price below long MA: {latest_price:.3f} <= {long_ma:.3f}", range_reason), latest_price, 0.1)
         _, trend_reason, _ = self._trend_entry_quality(candles, short_ma, long_ma)
         return Signal(Side.HOLD, self._combine_hold_reasons(trend_reason, range_reason), latest_price, 0.1)
+
+    def _cost_aware_edge_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> tuple[Signal | None, str]:
+        """Single entry gate that must clear cost, downside, and setup quality.
+
+        The previous engine had many independent entry paths. In live runs that
+        produced frequent small losses because a weak setup could bypass the
+        practical transaction-cost check. This gate ranks common spot-trading
+        setups, then only emits the best one when the expected move is large
+        enough after estimated downside and round-trip costs.
+        """
+        features = chart_feature_snapshot(candles, self.config.rsi_period)
+        if not features or len(candles) < max(24, self.config.long_window + 4):
+            latest = candles[-1].close if candles else 0.0
+            return None, f"cost-aware edge blocked: insufficient candles for edge model at {latest:.3f}"
+
+        closes = [c.close for c in candles]
+        latest = closes[-1]
+        previous = closes[-2]
+        if latest <= 0 or previous <= 0:
+            return None, "cost-aware edge blocked: invalid price"
+
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
+        ema55 = calculate_ema(closes, 55)
+        bands = control_limits(closes, window=20, stddev_multiplier=1.65)
+        prior_bands = control_limits(closes[:-1], window=20, stddev_multiplier=1.65)
+        if bands is None or prior_bands is None or ema9 is None or ema21 is None:
+            return None, "cost-aware edge blocked: indicators unavailable"
+
+        ucl, center, lcl = bands
+        prev_ucl, _prev_center, prev_lcl = prior_bands
+        recent = candles[-20:]
+        recent_high = max(c.high for c in recent)
+        recent_low = min(c.low for c in recent)
+        recent_range_pct = ((recent_high / recent_low) - 1.0) * 100.0 if recent_low > 0 else 0.0
+        volatility = recent_volatility_pct(candles, lookback=20)
+        expected_upside = max(
+            estimate_trend_follow_through_pct(candles, self.config.target_upside_pct),
+            estimate_expected_upside_pct(candles, self.config.target_upside_pct),
+            min(self.config.target_upside_pct, max(0.0, features["momentum_8_pct"] * 0.75 + volatility * 1.20)),
+        )
+        expected_downside = estimate_expected_downside_pct(
+            candles,
+            self.config.stop_loss_pct,
+            self.config.stop_volatility_multiplier,
+        )
+        cost_buffer = max(0.20, self.config.min_net_edge_pct + 0.05)
+        net_edge = expected_upside - expected_downside - cost_buffer
+        reward_risk = expected_upside / expected_downside if expected_downside > 0 else 0.0
+
+        momentum_3 = features["momentum_3_pct"]
+        momentum_8 = features["momentum_8_pct"]
+        volume = features["volume_ratio"]
+        rsi = features["rsi"]
+        close_position = features["close_position"]
+        ema9_gap = features["ema9_gap_pct"]
+        ema21_gap = features["ema21_gap_pct"]
+        high_gap = features["recent_high_gap_pct"]
+        low_distance = features["distance_from_low_pct"]
+        expansion = features["range_expansion_ratio"]
+        trend_slope = ((short_ma / long_ma) - 1.0) * 100.0 if long_ma > 0 else 0.0
+        ema55_gap = ((latest / ema55) - 1.0) * 100.0 if ema55 and ema55 > 0 else 0.0
+        ucl_break_pct = ((latest / prev_ucl) - 1.0) * 100.0 if prev_ucl > 0 else 0.0
+        lcl_reclaim_pct = ((latest / lcl) - 1.0) * 100.0 if lcl > 0 else 0.0
+        one_tick_pct = ((latest / previous) - 1.0) * 100.0
+
+        base_edge_ok = (
+            expected_upside >= max(0.90, self.config.min_expected_upside_pct)
+            and net_edge >= max(0.18, self.config.min_net_edge_pct)
+            and reward_risk >= 1.55
+            and close_position >= 0.42
+            and volume >= 0.82
+            and 25.0 <= rsi <= min(73.0, self.config.max_entry_rsi + 1.0)
+        )
+        if not base_edge_ok:
+            return (
+                None,
+                (
+                    "cost-aware edge blocked: "
+                    f"upside {expected_upside:.2f}%, downside {expected_downside:.2f}%, "
+                    f"net {net_edge:.2f}%, rr {reward_risk:.2f}, volume {volume:.2f}x, "
+                    f"rsi {rsi:.1f}, close {close_position:.2f}"
+                ),
+            )
+
+        candidates: list[tuple[float, str, str]] = []
+
+        breakout_score = (
+            0.20 * clamp01((ucl_break_pct + 0.10) / 0.75)
+            + 0.18 * clamp01((momentum_3 - 0.05) / 0.80)
+            + 0.16 * clamp01((momentum_8 - 0.10) / 1.80)
+            + 0.15 * clamp01((volume - 0.95) / 2.00)
+            + 0.13 * clamp01((close_position - 0.52) / 0.42)
+            + 0.10 * clamp01((0.95 - high_gap) / 0.95)
+            + 0.08 * clamp01((reward_risk - 1.30) / 1.50)
+        )
+        if (
+            latest >= prev_ucl * 1.0003
+            and latest >= recent_high * 0.995
+            and momentum_3 >= 0.16
+            and momentum_8 >= 0.18
+            and volume >= 1.10
+            and close_position >= 0.56
+            and 38.0 <= rsi <= 70.0
+            and breakout_score >= 0.48
+        ):
+            candidates.append((breakout_score, "breakout", f"ucl {ucl_break_pct:.2f}%, high gap {high_gap:.2f}%"))
+
+        trend_score = (
+            0.18 * clamp01((trend_slope + 0.08) / 0.55)
+            + 0.18 * clamp01((momentum_8 + 0.05) / 1.40)
+            + 0.16 * clamp01((momentum_3 + 0.02) / 0.65)
+            + 0.14 * clamp01((volume - 0.85) / 1.65)
+            + 0.12 * clamp01((close_position - 0.48) / 0.42)
+            + 0.10 * clamp01((ema9_gap + 0.20) / 0.90)
+            + 0.12 * clamp01((reward_risk - 1.25) / 1.60)
+        )
+        ema_stack_ok = ema55 is None or (ema9 >= ema21 * 0.998 and latest >= ema55 * 0.992)
+        if (
+            ema_stack_ok
+            and latest >= ema21 * 0.997
+            and momentum_3 >= 0.08
+            and momentum_8 >= 0.16
+            and volume >= 0.95
+            and close_position >= 0.50
+            and 39.0 <= rsi <= 68.0
+            and trend_score >= 0.50
+            and trend_slope >= -0.10
+        ):
+            candidates.append((trend_score, "trend_pullback", f"trend {trend_slope:.2f}%, ema55 {ema55_gap:.2f}%"))
+
+        lcl_touched = candles[-1].low <= lcl * 1.006 or candles[-2].low <= prev_lcl * 1.006
+        reversal_score = (
+            0.18 * clamp01((2.80 - low_distance) / 2.80)
+            + 0.17 * clamp01((momentum_3 + 0.04) / 0.62)
+            + 0.16 * clamp01((volume - 0.95) / 2.20)
+            + 0.14 * clamp01((close_position - 0.50) / 0.42)
+            + 0.12 * clamp01((54.0 - rsi) / 30.0)
+            + 0.11 * clamp01((one_tick_pct + 0.02) / 0.50)
+            + 0.12 * clamp01((reward_risk - 1.35) / 1.70)
+        )
+        if (
+            lcl_touched
+            and latest >= lcl * 1.004
+            and lcl_reclaim_pct >= 0.05
+            and low_distance <= 2.6
+            and one_tick_pct >= 0.02
+            and momentum_3 >= -0.03
+            and (momentum_8 >= -0.05 or rsi <= 42.0)
+            and volume >= 1.15
+            and close_position >= 0.56
+            and 28.0 <= rsi <= 48.0
+            and reversal_score >= 0.50
+        ):
+            candidates.append((reversal_score, "lcl_reclaim", f"lcl reclaim {lcl_reclaim_pct:.2f}%, low dist {low_distance:.2f}%"))
+
+        active_score = (
+            0.20 * clamp01((momentum_3 + 0.02) / 0.50)
+            + 0.18 * clamp01((volume - 0.75) / 1.50)
+            + 0.16 * clamp01((close_position - 0.45) / 0.45)
+            + 0.14 * clamp01((reward_risk - 1.45) / 1.50)
+            + 0.12 * clamp01((recent_range_pct - 0.75) / 2.25)
+            + 0.10 * clamp01((66.0 - abs(rsi - 50.0)) / 66.0)
+            + 0.10 * clamp01((net_edge - 0.12) / 0.70)
+        )
+        if (
+            active_score >= 0.68
+            and expected_upside >= 1.30
+            and net_edge >= 0.65
+            and reward_risk >= 2.00
+            and momentum_3 >= 0.18
+            and momentum_8 >= 0.05
+            and volume >= 1.15
+            and close_position >= 0.60
+            and 34.0 <= rsi <= 64.0
+        ):
+            candidates.append((active_score, "active_edge", f"range {recent_range_pct:.2f}%, net {net_edge:.2f}%"))
+
+        if not candidates:
+            return (
+                None,
+                (
+                    "cost-aware edge blocked: no setup passed "
+                    f"m3 {momentum_3:.2f}%, m8 {momentum_8:.2f}%, vol {volume:.2f}x, "
+                    f"rsi {rsi:.1f}, rr {reward_risk:.2f}, expansion {expansion:.2f}"
+                ),
+            )
+
+        score, setup, setup_detail = max(candidates, key=lambda item: item[0])
+        confidence = min(0.88, 0.50 + score * 0.42 + min(net_edge / 8.0, 0.06))
+        return (
+            Signal(
+                Side.BUY,
+                (
+                    f"cost-aware edge setup: {setup}; score {score:.2f}; {setup_detail}; "
+                    f"expected upside {expected_upside:.2f}%; downside {expected_downside:.2f}%; "
+                    f"net edge {net_edge:.2f}%; rr {reward_risk:.2f}; "
+                    f"momentum3 {momentum_3:.2f}%; momentum8 {momentum_8:.2f}%; "
+                    f"volume {volume:.2f}x; RSI {rsi:.1f}; close position {close_position:.2f}; "
+                    f"ema21 gap {ema21_gap:.2f}%"
+                ),
+                latest,
+                confidence,
+            ),
+            "",
+        )
 
     def _regime_ensemble_signal(self, candles: list[Candle], short_ma: float, long_ma: float) -> Signal | None:
         """Select one confirmed setup from control-band and trend regimes.

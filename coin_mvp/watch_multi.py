@@ -529,6 +529,7 @@ class MultiMarketTradingApp:
             return None
 
         best: tuple[float, str, list[Candle], Signal] | None = None
+        fallback: tuple[float, str, list[Candle], Signal] | None = None
         for market, candles in candles_by_market.items():
             if self.broker.get_position(market).is_open:
                 continue
@@ -566,18 +567,50 @@ class MultiMarketTradingApp:
                 self.config.strategy.stop_loss_pct,
                 self.config.strategy.stop_volatility_multiplier,
             )
-            if chart["volume_ratio"] < 0.90:
+            fallback_min_upside = max(0.55, expected_downside * 1.60, self._roundtrip_cost_pct() * 2.2)
+            latest = candles[-1]
+            stop_touch_price = latest.close * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
+            if (
+                expected_upside >= fallback_min_upside
+                and chart["volume_ratio"] >= 0.80
+                and chart["close_position"] >= 0.25
+                and 24.0 <= chart["rsi"] <= 76.0
+                and chart["momentum_8_pct"] >= 0.0
+                and latest.low > stop_touch_price
+            ):
+                fallback_confidence = 0.52
+                fallback_confidence += min(max(chart["momentum_3_pct"], 0.0) * 0.05, 0.04)
+                fallback_confidence += min(max(chart["volume_ratio"] - 0.35, 0.0) * 0.018, 0.04)
+                fallback_confidence += min(max(chart["close_position"] - 0.25, 0.0) * 0.06, 0.04)
+                fallback_signal = Signal(
+                    Side.BUY,
+                    (
+                        f"daily participation setup: fallback quota {self.risk.state.entries_today + 1}/{self.config.risk.min_entries_per_day}; "
+                        f"expected upside {expected_upside:.2f}%; expected downside {expected_downside:.2f}%; "
+                        f"momentum3 {chart['momentum_3_pct']:.2f}%; momentum8 {chart['momentum_8_pct']:.2f}%; "
+                        f"volume {chart['volume_ratio']:.2f}x; RSI {chart['rsi']:.1f}; close position {chart['close_position']:.2f}; "
+                        f"spread {spread_bps:.1f}bps"
+                    ),
+                    candles[-1].close,
+                    min(0.62, fallback_confidence),
+                )
+                fallback_score = candidate_score(candles, fallback_signal, self.config.strategy, penalty=breadth_penalty * 0.10)
+                fallback_score += min(max(expected_upside - expected_downside, 0.0) * 0.04, 0.08)
+                fallback_score += min(max(chart["volume_ratio"], 0.0) * 0.012, 0.05)
+                fallback_score += min(max(chart["close_position"], 0.0) * 0.04, 0.04)
+                fallback_score = max(fallback_score, self.config.risk.min_candidate_score - 0.08)
+                if fallback is None or fallback_score > fallback[0]:
+                    fallback = (fallback_score, market, candles, fallback_signal)
+            if chart["volume_ratio"] < 0.75:
                 continue
             if chart["momentum_8_pct"] < -4.0 and chart["close_position"] < 0.18:
                 continue
             if chart["rsi"] >= 95.0:
                 continue
-            if chart["close_position"] < 0.60:
+            if chart["close_position"] < 0.48:
                 continue
-            if chart["momentum_8_pct"] < -0.55 and chart["momentum_3_pct"] < 0.25:
+            if chart["momentum_8_pct"] < -0.85 and chart["momentum_3_pct"] < 0.15:
                 continue
-            latest = candles[-1]
-            stop_touch_price = latest.close * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
             if latest.low <= stop_touch_price:
                 continue
             try:
@@ -586,21 +619,26 @@ class MultiMarketTradingApp:
                 rank_candles = candles[-90:]
             rank_score, rank_reason = self._hybrid_rank_score(rank_candles)
             has_quality_hook = (
-                rank_score >= 0.12
-                or chart["momentum_3_pct"] >= 0.45
-                or (chart["close_position"] >= 0.78 and chart["momentum_8_pct"] >= 0.20)
+                rank_score >= 0.05
+                or chart["momentum_3_pct"] >= 0.25
+                or (chart["close_position"] >= 0.65 and chart["momentum_8_pct"] >= 0.0)
+                or (
+                    expected_upside >= expected_downside * 1.80
+                    and chart["volume_ratio"] >= 0.80
+                    and chart["close_position"] >= 0.55
+                )
             )
             if not has_quality_hook:
                 continue
             if chart["momentum_3_pct"] < 0.30 and "reversal" in rank_reason:
                 continue
-            if chart["momentum_3_pct"] < 0.05 and rank_score < 0.22:
+            if chart["momentum_3_pct"] < 0.05 and rank_score < 0.15:
                 continue
-            if chart["volume_ratio"] < 1.05 and rank_score < 0.22:
+            if chart["volume_ratio"] < 0.85 and rank_score < 0.15:
                 continue
-            if chart["close_position"] < 0.68 and chart["volume_ratio"] < 1.15:
+            if chart["close_position"] < 0.55 and chart["volume_ratio"] < 1.00:
                 continue
-            if chart["momentum_3_pct"] < 0.15 and chart["momentum_8_pct"] < 0.15:
+            if chart["momentum_3_pct"] < 0.08 and chart["momentum_8_pct"] < 0.05:
                 continue
             min_upside = max(
                 0.75,
@@ -612,11 +650,11 @@ class MultiMarketTradingApp:
             if chart["rsi"] > 70.0:
                 continue
             if self._is_defensive_market(context):
-                if chart["momentum_3_pct"] < 0.35:
+                if chart["momentum_3_pct"] < 0.20:
                     continue
-                if chart["volume_ratio"] < 1.15:
+                if chart["volume_ratio"] < 0.90:
                     continue
-                if chart["close_position"] < 0.72:
+                if chart["close_position"] < 0.55:
                     continue
                 if rank_score < 0.0 and chart["momentum_8_pct"] < 0.05:
                     continue
@@ -654,7 +692,7 @@ class MultiMarketTradingApp:
             score = max(score, self.config.risk.min_candidate_score - 0.04)
             if best is None or score > best[0]:
                 best = (score, market, candles, signal)
-        return best
+        return best or fallback
 
     def _hybrid_rank_score(self, candles: list[Candle]) -> tuple[float, str]:
         if len(candles) < 30:
@@ -1143,6 +1181,8 @@ class MultiMarketTradingApp:
         mode = str(getattr(context, "market_mode", "neutral"))
         if mode == "capital_protect":
             return False, "market mode blocked: capital protect"
+        if strategy_name == "cost_aware_edge":
+            return True, "market mode ok: cost-aware edge controls risk/reward internally"
         if strategy_name == "regime_reversal" and mode == "risk_off":
             return False, "market mode blocked: risk_off rejects regime_reversal"
         if strategy_name in {"regime_breakout", "regime_trend"} and mode != "risk_on":
@@ -1514,6 +1554,8 @@ class MultiMarketTradingApp:
             self.position_entry_strategy.pop(market, None)
 
     def _entry_strategy_name(self, signal: Signal) -> str:
+        if "cost-aware edge setup" in signal.reason:
+            return "cost_aware_edge"
         if "regime ensemble setup" in signal.reason:
             if "lcl reclaim reversal" in signal.reason:
                 return "regime_reversal"
@@ -1876,6 +1918,8 @@ def orderbook_imbalance_penalty(imbalance_ratio: float, min_imbalance_ratio: flo
 
 def strategy_name_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "cost-aware edge setup" in text:
+        return "cost_aware_edge"
     if "daily participation setup" in text:
         return "daily_participation"
     if "composite engine setup" in text:
@@ -1895,6 +1939,14 @@ def strategy_name_from_reason(reason: str) -> str:
 
 def reason_bucket_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "cost-aware edge setup: breakout" in text:
+        return "cost_edge_breakout"
+    if "cost-aware edge setup: trend_pullback" in text:
+        return "cost_edge_trend_pullback"
+    if "cost-aware edge setup: lcl_reclaim" in text:
+        return "cost_edge_lcl_reclaim"
+    if "cost-aware edge setup" in text:
+        return "cost_edge_active"
     if "daily participation setup" in text:
         return "daily_participation"
     if "composite engine setup: qullamaggie ucl breakout" in text:

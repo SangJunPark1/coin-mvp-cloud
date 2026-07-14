@@ -208,6 +208,8 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
         required = min(required, 0.68 if mode in {"risk_on", "neutral"} else 0.74)
     if "regime ensemble setup" in reason:
         required = min(required, 0.66 if mode in {"risk_on", "neutral"} else 0.74)
+    if "cost-aware edge setup" in reason:
+        required = min(required, 0.60 if mode in {"risk_on", "neutral", "risk_off"} else 0.72)
     if "range rebound setup" in reason:
         required += 0.06
     if "micro recovery setup" in reason:
@@ -224,6 +226,28 @@ def required_model_probability(decision_input: dict[str, Any], context: Decision
 def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str, float]) -> str:
     reason = str(decision_input.get("candidate", {}).get("signal_reason", "")).lower()
     mode = str(decision_input.get("market_context", {}).get("market_mode", "neutral")).lower()
+    if "cost-aware edge setup" in reason:
+        if features.get("reward_risk_ratio", 0.0) < 1.55:
+            return "AI hard block: cost-aware edge reward/risk is too weak."
+        if features.get("expected_upside_pct", 0.0) < 0.85:
+            return "AI hard block: cost-aware edge expected upside is too small."
+        if features.get("volume_ratio", 0.0) < 0.82:
+            return "AI hard block: cost-aware edge volume is too thin."
+        if features.get("close_position", 0.0) < 0.42:
+            return "AI hard block: cost-aware edge close quality is weak."
+        if features.get("rsi", 0.0) > 73.0:
+            return "AI hard block: cost-aware edge RSI is overheated."
+        if "lcl_reclaim" in reason:
+            if features.get("rsi", 0.0) > 48.0:
+                return "AI hard block: LCL reclaim is not low enough for a reversal."
+            if features.get("momentum_8_pct", 0.0) < -0.05 and features.get("rsi", 0.0) > 42.0:
+                return "AI hard block: LCL reclaim medium momentum has not recovered."
+        if "active_edge" in reason:
+            if mode in {"capital_protect", "risk_off"}:
+                return "AI hard block: active edge is blocked in weak-market mode."
+            if features.get("momentum_8_pct", 0.0) < 0.05:
+                return "AI hard block: active edge medium momentum is not positive."
+        return ""
     if "regime ensemble setup" in reason:
         if features.get("reward_risk_ratio", 0.0) < 1.65:
             return "AI hard block: regime ensemble reward/risk is too weak."
@@ -239,18 +263,21 @@ def upgraded_model_hard_block(decision_input: dict[str, Any], features: dict[str
     if "daily participation setup" in reason:
         if mode == "capital_protect":
             return "AI hard block: daily participation is blocked in capital-protect mode."
+        is_fallback = "fallback quota" in reason
         strategy_limits = decision_input.get("strategy_limits", {})
         configured_min_upside = float(strategy_limits.get("min_expected_upside_pct", 0.75) or 0.75)
-        if features.get("expected_upside_pct", 0.0) < max(0.75, configured_min_upside):
+        if features.get("expected_upside_pct", 0.0) < (0.55 if is_fallback else max(0.75, configured_min_upside)):
             return "AI hard block: daily participation expected upside is too small."
-        if features.get("reward_risk_ratio", 0.0) < 1.55:
+        if features.get("reward_risk_ratio", 0.0) < (1.60 if is_fallback else 1.55):
             return "AI hard block: daily participation reward/risk is too weak."
-        if features.get("volume_ratio", 0.0) < 0.90:
+        if features.get("volume_ratio", 0.0) < (0.80 if is_fallback else 0.75):
             return "AI hard block: daily participation volume is too thin."
-        if features.get("close_position", 0.0) < 0.60:
+        if features.get("close_position", 0.0) < (0.25 if is_fallback else 0.48):
             return "AI hard block: daily participation close quality is weak."
-        if features.get("momentum_8_pct", 0.0) < -0.55 and features.get("momentum_3_pct", 0.0) < 0.25:
+        if features.get("momentum_8_pct", 0.0) < -0.85 and features.get("momentum_3_pct", 0.0) < 0.15:
             return "AI hard block: daily participation has weak bounce after negative momentum."
+        if is_fallback and features.get("momentum_8_pct", 0.0) < 0.0:
+            return "AI hard block: fallback participation medium momentum is negative."
         if features.get("rsi", 0.0) >= 95.0:
             return "AI hard block: daily participation is extremely overheated."
         if features.get("momentum_8_pct", 0.0) < -4.0 and features.get("close_position", 0.0) < 0.18:
