@@ -25,6 +25,7 @@ from coin_mvp.strategy import (
     estimate_expected_downside_pct,
     estimate_expected_upside_pct,
     market_breadth_ratio,
+    structured_breakout_signal,
     volatility_adjusted_position_fraction,
 )
 from coin_mvp.watch_multi import (
@@ -339,6 +340,49 @@ class ReportMetricsTest(unittest.TestCase):
 
 
 class StrategyFilterTest(unittest.TestCase):
+    def test_structured_breakout_requires_aligned_trend_resistance_and_volume(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        candles = []
+        for index in range(75):
+            close = 100.0 + index * 0.12
+            candles.append(
+                Candle(
+                    market="KRW-TEST",
+                    timestamp=start + timedelta(minutes=15 * index),
+                    open=close - 0.05,
+                    high=close + 0.10,
+                    low=close - 0.10,
+                    close=close,
+                    volume=100.0,
+                )
+            )
+        resistance = max(candle.high for candle in candles[-24:])
+        candles.append(
+            Candle(
+                market="KRW-TEST",
+                timestamp=start + timedelta(minutes=15 * 75),
+                open=resistance - 0.05,
+                high=resistance * 1.012,
+                low=resistance - 0.10,
+                close=resistance * 1.01,
+                volume=180.0,
+            )
+        )
+        config = StrategyConfig(
+            short_window=5,
+            long_window=20,
+            take_profit_pct=1.55,
+            stop_loss_pct=0.95,
+            position_fraction=0.25,
+            structured_breakout_only=True,
+            structured_max_rsi=100.0,
+        )
+
+        signal = structured_breakout_signal(candles, config)
+
+        self.assertEqual(signal.side, Side.BUY)
+        self.assertIn("structured breakout setup", signal.reason)
+
     def test_entry_blocks_overextended_move(self):
         config = StrategyConfig(
             short_window=3,

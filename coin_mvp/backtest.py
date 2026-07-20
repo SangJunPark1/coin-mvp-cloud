@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +62,14 @@ class ReplayDataSource:
         if unit == 1:
             end = min(self.current_index + 1, len(candles))
         else:
-            end = min(max(count, self.current_index // unit + 1), len(candles))
+            reference = self.candles_by_unit[1][market]
+            asof = reference[min(self.current_index, len(reference) - 1)].timestamp
+            end = 0
+            for candle in candles:
+                if candle.timestamp + timedelta(minutes=unit) <= asof:
+                    end += 1
+                else:
+                    break
         start = max(0, end - count)
         result = candles[start:end]
         if len(result) < count and result:
@@ -239,7 +246,7 @@ def compress_unit(unit_one: dict[str, list[Candle]], unit: int) -> dict[str, lis
             grouped.append(
                 Candle(
                     market=market,
-                    timestamp=chunk[-1].timestamp,
+                    timestamp=chunk[0].timestamp,
                     open=chunk[0].open,
                     high=max(candle.high for candle in chunk),
                     low=min(candle.low for candle in chunk),

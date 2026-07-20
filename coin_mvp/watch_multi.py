@@ -32,6 +32,7 @@ from .strategy import (
     market_breadth_ratio,
     mean,
     required_candle_count,
+    structured_breakout_signal,
     volatility_adjusted_position_fraction,
 )
 from .watch import refresh_report
@@ -312,8 +313,15 @@ class MultiMarketTradingApp:
                 if len(blocked_samples) < 20:
                     blocked_samples.append({"market": market, "reason": filter_reason, "price": candles[-1].close})
                 continue
-            signal = self.strategy.generate(candles, self.broker.get_position(market))
-            if signal.side != Side.BUY and not self.config.strategy.regime_ensemble_only:
+            if self.config.strategy.structured_breakout_only:
+                signal = self._structured_entry_signal(market, candles)
+            else:
+                signal = self.strategy.generate(candles, self.broker.get_position(market))
+            if (
+                signal.side != Side.BUY
+                and not self.config.strategy.regime_ensemble_only
+                and not self.config.strategy.structured_breakout_only
+            ):
                 signal = self._bollinger_rebound_entry_signal(candles, filter_reason, signal)
             if signal.side == Side.BUY:
                 strategy_gate_ok, strategy_gate_reason = self._candidate_adaptive_gate(market, signal, context)
@@ -322,18 +330,19 @@ class MultiMarketTradingApp:
                     if len(blocked_samples) < 20:
                         blocked_samples.append({"market": market, "reason": strategy_gate_reason, "price": candles[-1].close})
                     continue
-                recovery_ok, recovery_reason = self._validated_recovery_ok(candles, signal)
-                if not recovery_ok:
-                    blocked_reasons[recovery_reason] = blocked_reasons.get(recovery_reason, 0) + 1
-                    if len(blocked_samples) < 20:
-                        blocked_samples.append({"market": market, "reason": recovery_reason, "price": candles[-1].close})
-                    continue
-                rr_ok, rr_reason = self._reward_risk_ok(candles, signal)
-                if not rr_ok:
-                    blocked_reasons[rr_reason] = blocked_reasons.get(rr_reason, 0) + 1
-                    if len(blocked_samples) < 20:
-                        blocked_samples.append({"market": market, "reason": rr_reason, "price": candles[-1].close})
-                    continue
+                if not self.config.strategy.structured_breakout_only:
+                    recovery_ok, recovery_reason = self._validated_recovery_ok(candles, signal)
+                    if not recovery_ok:
+                        blocked_reasons[recovery_reason] = blocked_reasons.get(recovery_reason, 0) + 1
+                        if len(blocked_samples) < 20:
+                            blocked_samples.append({"market": market, "reason": recovery_reason, "price": candles[-1].close})
+                        continue
+                    rr_ok, rr_reason = self._reward_risk_ok(candles, signal)
+                    if not rr_ok:
+                        blocked_reasons[rr_reason] = blocked_reasons.get(rr_reason, 0) + 1
+                        if len(blocked_samples) < 20:
+                            blocked_samples.append({"market": market, "reason": rr_reason, "price": candles[-1].close})
+                        continue
                 penalty = (
                     self._recent_stopout_penalty(market, tick)
                     + self._entry_filter_penalty_for_signal(signal, filter_reason, filter_penalty)
@@ -746,6 +755,44 @@ class MultiMarketTradingApp:
         if hour in blocked_hours:
             return True, f"blocked entry hour: {hour:02d} KST"
         return False, ""
+
+    def _structured_entry_signal(self, market: str, execution_candles: list[Candle]) -> Signal:
+        config = self.config.strategy
+        count = max(
+            config.structured_trend_ema + 12,
+            config.structured_breakout_lookback + 4,
+            config.rsi_period + 3,
+        )
+        try:
+            higher_timeframe = self.data_source.get_recent_candles(
+                market,
+                count + 2,
+                unit_minutes=config.structured_timeframe_minutes,
+            )
+        except Exception as exc:
+            return Signal(
+                Side.HOLD,
+                f"structured breakout blocked: timeframe fetch failed {exc!r}",
+                execution_candles[-1].close,
+                0.0,
+            )
+        asof = execution_candles[-1].timestamp
+        unit_delta = timedelta(minutes=config.structured_timeframe_minutes)
+        closed = [
+            candle
+            for candle in higher_timeframe
+            if candle.timestamp + unit_delta <= asof
+        ]
+        signal = structured_breakout_signal(closed[-count:], config)
+        if signal.side != Side.BUY:
+            return Signal(signal.side, signal.reason, execution_candles[-1].close, signal.confidence)
+        return Signal(
+            Side.BUY,
+            signal.reason,
+            execution_candles[-1].close,
+            signal.confidence,
+            signal.size_fraction,
+        )
 
     def _entry_market_filters(self, tick: int, market: str, candles: list[Candle]) -> tuple[bool, str, float]:
         latest_price = candles[-1].close
@@ -1457,6 +1504,13 @@ class MultiMarketTradingApp:
     def _position_management_signal(self, tick: int, market: str, candles: list[Candle], latest_price: float, position) -> Signal:
         if not position.is_open:
             return Signal(Side.HOLD, "no position", latest_price, 0.0)
+        if self.config.strategy.structured_breakout_only:
+            return Signal(
+                Side.HOLD,
+                "structured breakout position: deterministic stop/target/time management",
+                latest_price,
+                0.2,
+            )
         avg_price = position.avg_price
         pnl_pct = (latest_price / avg_price - 1.0) * 100.0 if avg_price > 0 else 0.0
         estimated_stop_loss_pct = estimate_expected_downside_pct(candles, self.config.strategy.stop_loss_pct, self.config.strategy.stop_volatility_multiplier)
@@ -1554,6 +1608,8 @@ class MultiMarketTradingApp:
             self.position_entry_strategy.pop(market, None)
 
     def _entry_strategy_name(self, signal: Signal) -> str:
+        if "structured breakout setup" in signal.reason:
+            return "structured_breakout"
         if "cost-aware edge setup" in signal.reason:
             return "cost_aware_edge"
         if "regime ensemble setup" in signal.reason:
@@ -1651,6 +1707,13 @@ class MultiMarketTradingApp:
             return signal
         held_ticks = tick - entry_tick
         pnl_pct = (latest_price / position.avg_price - 1.0) * 100.0
+        if self.config.strategy.structured_breakout_only and held_ticks >= max_ticks:
+            return Signal(
+                Side.SELL,
+                f"structured breakout time exit: held {held_ticks} ticks, pnl {pnl_pct:.2f}%",
+                latest_price,
+                0.82,
+            )
         profit_floor_pct = max(self.config.strategy.time_stop_min_pnl_pct, self._roundtrip_cost_pct() * 1.4)
         loss_floor_pct = max(0.22, self.config.strategy.stop_loss_pct * 0.80)
         if held_ticks >= max_ticks and pnl_pct >= profit_floor_pct:
@@ -1918,6 +1981,8 @@ def orderbook_imbalance_penalty(imbalance_ratio: float, min_imbalance_ratio: flo
 
 def strategy_name_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "structured breakout setup" in text:
+        return "structured_breakout"
     if "cost-aware edge setup" in text:
         return "cost_aware_edge"
     if "daily participation setup" in text:
@@ -1939,6 +2004,8 @@ def strategy_name_from_reason(reason: str) -> str:
 
 def reason_bucket_from_reason(reason: str) -> str:
     text = reason.lower()
+    if "structured breakout setup" in text:
+        return "structured_breakout"
     if "cost-aware edge setup: breakout" in text:
         return "cost_edge_breakout"
     if "cost-aware edge setup: trend_pullback" in text:

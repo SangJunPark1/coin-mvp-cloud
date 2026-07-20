@@ -33,6 +33,13 @@ class MovingAverageStrategy:
                 return Signal(Side.SELL, f"take profit reached: {pnl_pct:.2f}%", latest_price, 0.8)
             if pnl_pct <= -self.config.stop_loss_pct:
                 return Signal(Side.SELL, f"stop loss reached: {pnl_pct:.2f}%", latest_price, 0.9)
+            if self.config.structured_breakout_only:
+                return Signal(
+                    Side.HOLD,
+                    "structured breakout position: wait for deterministic stop, target, or time exit",
+                    latest_price,
+                    0.4,
+                )
             if short_ma < long_ma and latest_price < long_ma:
                 return Signal(Side.SELL, "trend break", latest_price, 0.6)
             return Signal(Side.HOLD, "position open, no exit condition", latest_price, 0.2)
@@ -1204,4 +1211,103 @@ def required_candle_count(config: StrategyConfig) -> int:
         21,
         config.long_trend_ema_window,
         config.btc_long_window + 5,
+    )
+
+
+def structured_breakout_signal(candles: list[Candle], config: StrategyConfig) -> Signal:
+    """Objective trend + resistance + volume confirmation entry.
+
+    This deliberately excludes subjective unfinished patterns and counter-trend
+    bottom picking. The parameters mirror the walk-forward research script.
+    """
+    latest_price = candles[-1].close if candles else 0.0
+    required = max(
+        config.structured_trend_ema + 10,
+        config.structured_breakout_lookback + 3,
+        config.rsi_period + 2,
+    )
+    if len(candles) < required:
+        return Signal(Side.HOLD, "structured breakout blocked: insufficient closed candles", latest_price, 0.0)
+    closes = [candle.close for candle in candles]
+    latest = candles[-1]
+    previous = candles[-2]
+    fast = calculate_ema(closes, config.structured_fast_ema)
+    slow = calculate_ema(closes, config.structured_slow_ema)
+    trend = calculate_ema(closes, config.structured_trend_ema)
+    prior_trend = calculate_ema(closes[:-4], config.structured_trend_ema)
+    rsi = calculate_rsi(closes, config.rsi_period)
+    if fast is None or slow is None or trend is None or prior_trend is None or rsi is None:
+        return Signal(Side.HOLD, "structured breakout blocked: indicators unavailable", latest_price, 0.0)
+    if not (latest.close > fast > slow > trend and trend > prior_trend):
+        return Signal(
+            Side.HOLD,
+            (
+                "structured breakout blocked: EMA trend not aligned "
+                f"price {latest.close:.3f}, EMA{config.structured_fast_ema} {fast:.3f}, "
+                f"EMA{config.structured_slow_ema} {slow:.3f}, EMA{config.structured_trend_ema} {trend:.3f}"
+            ),
+            latest_price,
+            0.1,
+        )
+    if not config.structured_min_rsi <= rsi <= config.structured_max_rsi:
+        return Signal(
+            Side.HOLD,
+            f"structured breakout blocked: RSI {rsi:.1f} outside validated range",
+            latest_price,
+            0.1,
+        )
+    baseline_volume = mean([candle.volume for candle in candles[-21:-1]])
+    volume_ratio = latest.volume / baseline_volume if baseline_volume > 0 else 0.0
+    prior_high = max(
+        candle.high
+        for candle in candles[-config.structured_breakout_lookback - 1 : -1]
+    )
+    close_position = (
+        1.0
+        if latest.high <= latest.low
+        else (latest.close - latest.low) / (latest.high - latest.low)
+    )
+    confirmed = (
+        previous.close <= prior_high * 1.002
+        and latest.close > prior_high
+        and latest.close > latest.open
+        and volume_ratio >= config.structured_min_volume_ratio
+        and close_position >= 0.62
+    )
+    if not confirmed:
+        return Signal(
+            Side.HOLD,
+            (
+                "structured breakout blocked: resistance/volume confirmation missing "
+                f"price {latest.close:.3f}, resistance {prior_high:.3f}, "
+                f"volume {volume_ratio:.2f}x, close {close_position:.2f}"
+            ),
+            latest_price,
+            0.1,
+        )
+    extension_pct = (latest.close / fast - 1.0) * 100.0
+    volatility_pct = recent_volatility_pct(candles, lookback=14)
+    if extension_pct > max(2.5, volatility_pct * 1.8):
+        return Signal(
+            Side.HOLD,
+            f"structured breakout blocked: overextended {extension_pct:.2f}%",
+            latest_price,
+            0.1,
+        )
+    confidence = min(
+        0.88,
+        0.58
+        + min((volume_ratio - config.structured_min_volume_ratio) * 0.08, 0.12)
+        + min(max(close_position - 0.62, 0.0) * 0.20, 0.06),
+    )
+    return Signal(
+        Side.BUY,
+        (
+            "structured breakout setup: "
+            f"EMA {config.structured_fast_ema}>{config.structured_slow_ema}>{config.structured_trend_ema}; "
+            f"{config.structured_breakout_lookback}-bar resistance {prior_high:.3f} broken; "
+            f"volume {volume_ratio:.2f}x; RSI {rsi:.1f}; close position {close_position:.2f}"
+        ),
+        latest_price,
+        confidence,
     )

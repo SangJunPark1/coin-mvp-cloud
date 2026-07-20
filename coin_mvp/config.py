@@ -73,6 +73,15 @@ class StrategyConfig:
     crash_candle_volume_ratio: float = 1.4
     crash_candle_break_lookback: int = 12
     regime_ensemble_only: bool = False
+    structured_breakout_only: bool = False
+    structured_timeframe_minutes: int = 15
+    structured_fast_ema: int = 12
+    structured_slow_ema: int = 26
+    structured_trend_ema: int = 60
+    structured_breakout_lookback: int = 24
+    structured_min_volume_ratio: float = 1.25
+    structured_min_rsi: float = 42.0
+    structured_max_rsi: float = 70.0
 
 
 @dataclass(frozen=True)
@@ -226,6 +235,15 @@ def load_config(path: str | Path) -> AppConfig:
             crash_candle_volume_ratio=float(strategy.get("crash_candle_volume_ratio", 1.4)),
             crash_candle_break_lookback=int(strategy.get("crash_candle_break_lookback", 12)),
             regime_ensemble_only=bool(strategy.get("regime_ensemble_only", False)),
+            structured_breakout_only=bool(strategy.get("structured_breakout_only", False)),
+            structured_timeframe_minutes=int(strategy.get("structured_timeframe_minutes", 15)),
+            structured_fast_ema=int(strategy.get("structured_fast_ema", 12)),
+            structured_slow_ema=int(strategy.get("structured_slow_ema", 26)),
+            structured_trend_ema=int(strategy.get("structured_trend_ema", 60)),
+            structured_breakout_lookback=int(strategy.get("structured_breakout_lookback", 24)),
+            structured_min_volume_ratio=float(strategy.get("structured_min_volume_ratio", 1.25)),
+            structured_min_rsi=float(strategy.get("structured_min_rsi", 42.0)),
+            structured_max_rsi=float(strategy.get("structured_max_rsi", 70.0)),
         ),
         risk=RiskConfig(
             daily_profit_target_pct=float(risk["daily_profit_target_pct"]),
@@ -405,6 +423,16 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("crash_candle_volume_ratio must be positive.")
     if config.strategy.crash_candle_break_lookback < 2:
         raise ValueError("crash_candle_break_lookback must be at least 2.")
+    if config.strategy.structured_timeframe_minutes not in (1, 3, 5, 10, 15, 30, 60, 240):
+        raise ValueError("structured_timeframe_minutes must be an Upbit minute candle unit.")
+    if not 0 < config.strategy.structured_fast_ema < config.strategy.structured_slow_ema < config.strategy.structured_trend_ema:
+        raise ValueError("structured EMA windows must satisfy fast < slow < trend.")
+    if config.strategy.structured_breakout_lookback < 5:
+        raise ValueError("structured_breakout_lookback must be at least 5.")
+    if config.strategy.structured_min_volume_ratio <= 0:
+        raise ValueError("structured_min_volume_ratio must be positive.")
+    if not 0 <= config.strategy.structured_min_rsi < config.strategy.structured_max_rsi <= 100:
+        raise ValueError("structured RSI bounds must satisfy 0 <= min < max <= 100.")
     if not 0 < config.risk.max_position_fraction <= 1:
         raise ValueError("max_position_fraction must be between 0 and 1.")
     if config.risk.max_open_positions < 1:
