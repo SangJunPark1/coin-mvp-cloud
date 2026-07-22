@@ -16,6 +16,7 @@ from .risk import RiskState
 from .watch_multi import MultiMarketTradingApp
 
 KST = timezone(timedelta(hours=9))
+MAX_CATCH_UP_TICKS = 12
 
 
 def main() -> None:
@@ -119,6 +120,14 @@ def run_cloud_ticks(
     effective_top_markets = min(max(6, top_markets), 12)
     data_source = UpbitPublicDataSource()
     markets = data_source.get_top_krw_markets(effective_top_markets, min_trade_price_krw=config.strategy.min_price_krw)
+    now = datetime.now(KST)
+    last_run_at = parse_kst_time(str(state.get("last_run_at") or "")) if state else None
+    catch_up_times, skipped_catch_up = missed_tick_times(
+        last_run_at,
+        now,
+        cooldown,
+        max_ticks=MAX_CATCH_UP_TICKS,
+    )
     app = MultiMarketTradingApp(config, data_source, markets, request_delay=request_delay)
     if state:
         apply_state(app, state)
@@ -137,7 +146,28 @@ def run_cloud_ticks(
 
     previous_tick = int(state.get("tick", 0)) if state else 0
     completed_tick = previous_tick
-    for tick in range(previous_tick + 1, previous_tick + max(1, ticks) + 1):
+    caught_up = 0
+    if catch_up_times:
+        caught_up = run_historical_catch_up(
+            app,
+            data_source,
+            markets,
+            catch_up_times,
+            previous_tick,
+        )
+        completed_tick += caught_up
+        app.journal.event(
+            "cloud_catch_up",
+            {
+                "from": catch_up_times[0].isoformat(timespec="seconds"),
+                "to": catch_up_times[-1].isoformat(timespec="seconds"),
+                "processed": caught_up,
+                "skipped_older": skipped_catch_up,
+                "cadence_seconds": cooldown,
+                "method": "point_in_time_candle_replay",
+            },
+        )
+    for tick in range(completed_tick + 1, completed_tick + max(1, ticks) + 1):
         app.run_tick(tick)
         completed_tick = tick
 
@@ -149,6 +179,8 @@ def run_cloud_ticks(
     return {
         "ok": True,
         "tick": completed_tick,
+        "catch_up_ticks": caught_up,
+        "catch_up_skipped_older": skipped_catch_up,
         "cash": app.broker.cash,
         "equity": app.broker.equity(app.last_prices),
         "positions": {market: asdict(position) for market, position in app.broker.positions.items()},
@@ -156,6 +188,74 @@ def run_cloud_ticks(
         "outputs": [str(output) for output in outputs],
         "storage": "remote" if storage.enabled else "local",
     }
+
+
+def missed_tick_times(
+    last_run_at: datetime | None,
+    now: datetime,
+    cadence_seconds: int,
+    max_ticks: int = MAX_CATCH_UP_TICKS,
+) -> tuple[list[datetime], int]:
+    """Return missed scheduled instants, excluding the current live invocation."""
+    if last_run_at is None or cadence_seconds <= 0 or max_ticks <= 0:
+        return [], 0
+    cadence = timedelta(seconds=cadence_seconds)
+    elapsed_slots = int((now - last_run_at).total_seconds() // cadence_seconds)
+    missed_count = max(0, elapsed_slots - 1)
+    if missed_count == 0:
+        return [], 0
+    all_times = [last_run_at + cadence * slot for slot in range(1, missed_count + 1)]
+    skipped = max(0, len(all_times) - max_ticks)
+    return all_times[-max_ticks:], skipped
+
+
+def run_historical_catch_up(
+    app: MultiMarketTradingApp,
+    live_source: UpbitPublicDataSource,
+    markets: list[str],
+    scheduled_times: list[datetime],
+    previous_tick: int,
+) -> int:
+    """Replay missed ticks from candles known at each scheduled instant."""
+    from . import watch_multi as watch_multi_module
+    from .backtest import ReplayDataSource, historical_backtest_context
+    from .strategy import required_candle_count
+
+    newest = scheduled_times[-1].astimezone(timezone.utc)
+    oldest = scheduled_times[0].astimezone(timezone.utc)
+    span_minutes = max(1, int((newest - oldest).total_seconds() // 60))
+    one_minute_count = min(400, max(required_candle_count(app.config.strategy) + span_minutes + 10, 240))
+    candles_by_unit: dict[int, dict[str, list[Any]]] = {1: {}, 5: {}, 15: {}, 60: {}}
+    for market in markets:
+        candles_by_unit[1][market] = live_source.get_recent_candles(market, one_minute_count, unit_minutes=1)
+        candles_by_unit[5][market] = live_source.get_recent_candles(market, 100, unit_minutes=5)
+        candles_by_unit[15][market] = live_source.get_recent_candles(market, 100, unit_minutes=15)
+        candles_by_unit[60][market] = live_source.get_recent_candles(market, 100, unit_minutes=60)
+
+    reference = candles_by_unit[1][markets[0]]
+    replay = ReplayDataSource(candles_by_unit, markets, start_index=0)
+    original_source = app.data_source
+    original_context = watch_multi_module.collect_decision_context
+    app.data_source = replay
+    watch_multi_module.collect_decision_context = lambda _source, _strategy: historical_backtest_context(replay, app.config)
+    completed = 0
+    try:
+        for scheduled_at in scheduled_times:
+            asof = scheduled_at.astimezone(timezone.utc)
+            eligible = [
+                index
+                for index, candle in enumerate(reference)
+                if candle.timestamp + timedelta(minutes=1) <= asof
+            ]
+            if not eligible:
+                continue
+            replay.set_index(eligible[-1])
+            app.run_tick(previous_tick + completed + 1)
+            completed += 1
+    finally:
+        app.data_source = original_source
+        watch_multi_module.collect_decision_context = original_context
+    return completed
 
 
 def load_state(path: Path) -> dict[str, Any]:

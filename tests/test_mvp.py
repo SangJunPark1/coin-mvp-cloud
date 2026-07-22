@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from coin_mvp.broker import PaperBroker
 from coin_mvp.ai_decision import extract_openai_json, review_entry_candidate
 from coin_mvp.backtest import backtest_verdict, candidate_stats, top_blocked_reasons
-from coin_mvp.cloud_tick import resume_state
+from coin_mvp.cloud_tick import missed_tick_times, resume_state
 from coin_mvp.config import AiDecisionConfig, AppConfig, PathConfig, RiskConfig, StrategyConfig
 from coin_mvp.data import UpbitPublicDataSource
 from coin_mvp.market_context import DecisionContext, maybe_float
@@ -39,6 +39,20 @@ from coin_mvp.watch_multi import (
     reason_bucket_from_reason,
     strategy_name_from_reason,
 )
+
+
+class CloudScheduleTest(unittest.TestCase):
+    def test_missed_tick_times_excludes_current_live_tick_and_caps_old_slots(self):
+        kst = timezone(timedelta(hours=9))
+        last = datetime(2026, 7, 22, 18, 0, tzinfo=kst)
+        now = datetime(2026, 7, 22, 19, 10, tzinfo=kst)
+
+        times, skipped = missed_tick_times(last, now, cadence_seconds=300, max_ticks=12)
+
+        self.assertEqual(len(times), 12)
+        self.assertEqual(skipped, 1)
+        self.assertEqual(times[0], datetime(2026, 7, 22, 18, 10, tzinfo=kst))
+        self.assertEqual(times[-1], datetime(2026, 7, 22, 19, 5, tzinfo=kst))
 
 
 class PaperBrokerTest(unittest.TestCase):
